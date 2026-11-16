@@ -1,0 +1,9 @@
+# API keys
+.env
+
+# Created when you run the notebooks
+qoblib_data/
+*.sol
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
