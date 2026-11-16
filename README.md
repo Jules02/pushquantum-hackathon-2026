@@ -64,11 +64,11 @@ helper file.
 
 ## Known limits
 
-* **Saved outputs** come from one run on the local simulator with no API key, so the characterization
-  and warm-start cells show their "Skipped" messages. Your numbers will differ from run to run, and more
-  so on the cloud.
-* **Run times (local simulator, one run, 12-core Mac):** 00 under 30 s, 01 under a minute, 02 under
-  30 s. Colab is slower.
+* **Saved outputs** come from one run with an API key: circuits on the local simulator, the
+  Characterization Service calls (notebooks 00 and 01) in Qoro's cloud. Your numbers will differ from
+  run to run, and more so with `USE_CLOUD = True`.
+* **Run times (one run, 12-core Mac):** 00 about 7 minutes, most of it the characterization call in
+  section 1.2 (under 30 s without a key); 01 under a minute; 02 under 30 s. Colab is slower.
 * **Classical tools do much of the work.** Repair and local search are classical and strong; compare
   every quantum result with the classical baselines in the notebooks before claiming a quantum
   contribution.
