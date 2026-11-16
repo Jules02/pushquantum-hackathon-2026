@@ -65,10 +65,11 @@ helper file.
 ## Known limits
 
 * **Saved outputs** come from one run with an API key: circuits on the local simulator, the
-  Characterization Service calls (notebooks 00 and 01) in Qoro's cloud. Your numbers will differ from
+  Characterization Service calls (one in each notebook) in Qoro's cloud. Your numbers will differ from
   run to run, and more so with `USE_CLOUD = True`.
-* **Run times (one run, 12-core Mac):** 00 about 7 minutes, most of it the characterization call in
-  section 1.2 (under 30 s without a key); 01 under a minute; 02 under 30 s. Colab is slower.
+* **Run times (one run, 12-core Mac):** 00 about 7 minutes, 01 under a minute, 02 about 3 minutes.
+  Most of it is the characterization calls, which took from seconds to 9 minutes in our runs; without
+  a key, every notebook runs in under a minute. Colab is slower.
 * **Classical tools do much of the work.** Repair and local search are classical and strong; compare
   every quantum result with the classical baselines in the notebooks before claiming a quantum
   contribution.
