@@ -9,11 +9,11 @@ hackathon credits.
 
 ## The notebooks
 
-| Notebook | | What it is |
-|---|---|---|
-| [`00_main_qubo_101.ipynb`](00_main_qubo_101.ipynb) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/QoroQuantum/pushquantum-hackathon-2026/blob/main/00_main_qubo_101.ipynb) | **Start here.** Part 0: API key, install, backend. Part 1, QUBO 101 with Divi: build a QUBO, characterize and validate it, QAOA blind and warm-started, PCE, partitioning. Part 2: choose your problem, run it in Colab, hand in. |
-| [`01_portfolio_optimisation.ipynb`](01_portfolio_optimisation.ipynb) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/QoroQuantum/pushquantum-hackathon-2026/blob/main/01_portfolio_optimisation.ipynb) | QOBLIB 06, multi-period portfolio optimisation: official model → QUBO → classical baseline → PCE and partitioned QAOA → solution file. 58 to about 36 000 binary variables. |
-| [`02_network_design.ipynb`](02_network_design.ipynb) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/QoroQuantum/pushquantum-hackathon-2026/blob/main/02_network_design.ipynb) | QOBLIB 08, network design: topology QUBO with Divi `LinearConstraint`s + exact routing LP → sample, score, write a solution file. 20 to 552 binary variables. |
+| Notebook | What it is |
+|---|---|
+| [`00_main_qubo_101.ipynb`](00_main_qubo_101.ipynb)<br>[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/QoroQuantum/pushquantum-hackathon-2026/blob/main/00_main_qubo_101.ipynb) | **Start here.** Part 0: API key, install, backend. Part 1, QUBO 101 with Divi: build a QUBO, characterize and validate it, QAOA blind and warm-started, PCE, partitioning. Part 2: choose your problem, run it in Colab, hand in. |
+| [`01_portfolio_optimisation.ipynb`](01_portfolio_optimisation.ipynb)<br>[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/QoroQuantum/pushquantum-hackathon-2026/blob/main/01_portfolio_optimisation.ipynb) | QOBLIB 06, multi-period portfolio optimisation: official model → QUBO → classical baseline → PCE and partitioned QAOA → solution file. 58 to about 36 000 binary variables. |
+| [`02_network_design.ipynb`](02_network_design.ipynb)<br>[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/QoroQuantum/pushquantum-hackathon-2026/blob/main/02_network_design.ipynb) | QOBLIB 08, network design: topology QUBO with Divi `LinearConstraint`s + exact routing LP → sample, score, write a solution file. 20 to 552 binary variables. |
 
 **Run order:** 00 first, then **one** of 01 or 02. Setup is explained only in notebook 00 and in this
 README; the problem notebooks repeat the setup code without the explanations.
@@ -28,7 +28,7 @@ hand in.
 2. **API key.** In Colab's left sidebar, click the key icon, add a secret named `QORO_API_KEY` with your
    key as its value, and switch on notebook access. Secrets belong to your Google account, so you add it
    once and switch on access in each notebook.
-3. **Install.** Run the notebook's first setup cell. It installs Divi 0.16.0 if it is missing; if it
+3. **Install.** Run the notebook's first setup cell. It installs Divi 0.16.1 if it is missing; if it
    installs anything, restart the session (Runtime → Restart session) and run from the top. Notebooks 01
    and 02 also download the helper file `qoblib_tools.py` in their setup.
 4. **To keep your changes,** save a copy to your Drive (File → Save a copy in Drive).
@@ -41,10 +41,10 @@ download what you want to keep.
 ```bash
 git clone https://github.com/QoroQuantum/pushquantum-hackathon-2026.git
 cd pushquantum-hackathon-2026
-pip install "qoro-divi[qubo-decompose,jupyter]==0.16.0"
+pip install "qoro-divi[qubo-decompose,jupyter]==0.16.1"
 ```
 
-Divi 0.16.0 needs Python 3.11 or newer. The version is pinned because names can change between Divi's
+Divi 0.16.1 needs Python 3.11 or newer. The version is pinned because names can change between Divi's
 minor versions. Put your key in a file called `.env` next to the notebooks, containing
 `QORO_API_KEY="your_api_key_here"`. The repository's `.gitignore` keeps `.env` out of commits.
 
@@ -67,9 +67,9 @@ helper file.
 * **Saved outputs** come from one run with an API key: circuits on the local simulator, the
   Characterization Service calls (one in each notebook) in Qoro's cloud. Your numbers will differ from
   run to run, and more so with `USE_CLOUD = True`.
-* **Run times (one run, 12-core Mac):** 00 about 7 minutes, 01 under a minute, 02 about 3 minutes.
-  Most of it is the characterization calls, which took from seconds to 9 minutes in our runs; without
-  a key, every notebook runs in under a minute. Colab is slower.
+* **Run times (one run, 12-core Mac):** 00 about 4 minutes, 01 about 9 minutes, 02 about 10 minutes.
+  The characterization calls took 3 to 6 minutes of each; without a key they are skipped. With
+  `USE_CLOUD = True`, each notebook took 10 to 20 minutes in our runs. Colab is slower.
 * **Classical tools do much of the work.** Repair and local search are classical and strong; compare
   every quantum result with the classical baselines in the notebooks before claiming a quantum
   contribution.
