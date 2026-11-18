@@ -19,8 +19,8 @@ hackathon credits.
 README; the problem notebooks repeat the setup code without the explanations.
 
 **How the winner is chosen:** the scale you reach, and the quality of your solution (QOBLIB's official
-objective) compared with the best results published on QOBLIB. Notebook 00, *Handing in*, says what to
-hand in.
+objective) compared with the best results published on QOBLIB. [Scoring](#scoring) explains how a
+solution is scored, and notebook 00, *Handing in*, says what to hand in.
 
 ## Running in Google Colab
 
@@ -77,15 +77,53 @@ Solution files use QOBLIB's own formats, and the problem notebooks write them fo
 The referee recomputes the objective from the positions or flows in the file, so the value written in the
 file doesn't count. Notebook 00, *Handing in*, lists what else to hand in.
 
+## Scoring
+
+The referee in `qoblib_tools.py` scores each solution from its `.sol` file, the same way QOBLIB's own
+checkers do. A solution that breaks a rule doesn't count. For both problems, a lower score is better.
+
+| Problem | Rules the referee checks | Score |
+|---|---|---|
+| Portfolio optimisation | Holdings of 0 to 3 units per asset and direction; the capital and budget limits in every period | QOBLIB's official objective: risk minus return, plus transaction, short-selling and liquidation costs, minus interest on cash |
+| Network design | Every node has exactly 2 outgoing and 2 incoming links; the flows deliver all the demand and use only chosen links | The largest total flow on any link, in units of 1/1000 |
+
+**Quality** is your gap to the best-known value published on QOBLIB:
+
+    gap = (your score − best known) / |best known|
+
+A gap of 0% matches the best-known value, and a negative gap beats it. For example, −69 169 on
+`po_a010_t10_orig` (budget 4, λ = 10⁻⁴; best known −69 482) is a gap of 0.45%. Best-known values are in
+QOBLIB's tables for [portfolio optimisation](https://github.com/ZIB-AOPT/QOBLIB/blob/main/06-portfolio/solutions/README.md)
+and [network design](https://github.com/ZIB-AOPT/QOBLIB/blob/main/08-network/solutions/README.md), and
+each problem notebook lists targets.
+
+**Scale** is the size of the instance you solve (its binary variables) and the qubits of your largest
+quantum program.
+
+To check a file before you hand it in:
+
+```python
+import qoblib_tools as qt
+
+# Portfolio optimisation
+header, positions = qt.read_portfolio_solution("po_a010_t10_orig_b004_l1e-4.sol")
+model = qt.PortfolioModel(qt.load_portfolio_instance(header["instance"]),
+                          budget=int(header["budget"]), lam=header["lambda"])
+print(model.score(positions))  # objective, feasible, breakdown, violations
+
+# Network design (network12 has 12 nodes)
+print(qt.check_network_solution("network12.sol", 12, qt.load_network_demand(12)))  # (valid, max_flow, message)
+```
+
 ## Known limits
 
 * **Saved outputs** come from one run with an API key: circuits on the local simulator, the
   Characterization Service calls (one in each notebook) in Qoro's cloud. Your numbers will differ from
   run to run, and more so with `USE_CLOUD = True`.
-* **Run times (one run, 12-core Mac):** 00 about 1 to 4 minutes, 01 about 9 minutes, 02 about 7
+* **Run times (one run, 12-core Mac):** 00 about 1 to 4 minutes, 01 about 6 minutes, 02 about 7
   minutes. Most of it is the characterization calls, which took from seconds to 6 minutes each; without
-  a key they are skipped and every notebook runs in under 5 minutes. With `USE_CLOUD = True`, each
-  notebook took 10 to 20 minutes in our runs. Colab is slower.
+  a key they are skipped and every notebook runs in under 5 minutes. With `USE_CLOUD = True`, 00 took
+  5 minutes and 02 took 7 minutes in our runs. Colab is slower.
 * **Classical tools do much of the work.** Repair and local search are classical and strong; compare
   every quantum result with the classical baselines in the notebooks before claiming a quantum
   contribution.
