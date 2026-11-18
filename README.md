@@ -62,14 +62,30 @@ checkers and match every published reference solution. It is the referee, so don
 data is downloaded from QOBLIB's GitHub repository on first use and cached in `qoblib_data/` next to the
 helper file.
 
+## Solution files
+
+Solution files use QOBLIB's own formats, and the problem notebooks write them for you:
+
+* **Portfolio optimisation:** QOBLIB's
+  [canonical format](https://github.com/ZIB-AOPT/QOBLIB/blob/main/06-portfolio/check/README.md#canonical-solution-format),
+  named `<instance>_b<budget>_l<lambda>.sol`, for example `po_a010_t10_orig_b004_l1e-4.sol`. Keep its
+  `instance`, `budget` and `lambda` header lines.
+* **Network design:** QOBLIB's
+  [Gurobi-style format](https://github.com/ZIB-AOPT/QOBLIB/blob/main/08-network/check/README.md#input-format),
+  named `network<NN>.sol`, for example `network12.sol`. The file name says which instance it solves.
+
+The referee recomputes the objective from the positions or flows in the file, so the value written in the
+file doesn't count. Notebook 00, *Handing in*, lists what else to hand in.
+
 ## Known limits
 
 * **Saved outputs** come from one run with an API key: circuits on the local simulator, the
   Characterization Service calls (one in each notebook) in Qoro's cloud. Your numbers will differ from
   run to run, and more so with `USE_CLOUD = True`.
-* **Run times (one run, 12-core Mac):** 00 about 4 minutes, 01 about 9 minutes, 02 about 10 minutes.
-  The characterization calls took 3 to 6 minutes of each; without a key they are skipped. With
-  `USE_CLOUD = True`, each notebook took 10 to 20 minutes in our runs. Colab is slower.
+* **Run times (one run, 12-core Mac):** 00 about 1 to 4 minutes, 01 about 9 minutes, 02 about 7
+  minutes. Most of it is the characterization calls, which took from seconds to 6 minutes each; without
+  a key they are skipped and every notebook runs in under 5 minutes. With `USE_CLOUD = True`, each
+  notebook took 10 to 20 minutes in our runs. Colab is slower.
 * **Classical tools do much of the work.** Repair and local search are classical and strong; compare
   every quantum result with the classical baselines in the notebooks before claiming a quantum
   contribution.
