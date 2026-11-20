@@ -41,10 +41,10 @@ download what you want to keep.
 ```bash
 git clone https://github.com/QoroQuantum/pushquantum-hackathon-2026.git
 cd pushquantum-hackathon-2026
-pip install "qoro-divi[qubo-decompose,jupyter]==0.16.1"
+pip install "qoro-divi[qubo-decompose,jupyter]==0.16.2"
 ```
 
-Divi 0.16.1 needs Python 3.11 or newer. The version is pinned because names can change between Divi's
+Divi 0.16.2 needs Python 3.11 or newer. The version is pinned because names can change between Divi's
 minor versions. Put your key in a file called `.env` next to the notebooks, containing
 `QORO_API_KEY="your_api_key_here"`. The repository's `.gitignore` keeps `.env` out of commits.
 
