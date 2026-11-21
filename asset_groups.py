@@ -345,12 +345,20 @@ def iterated_search(
     solver: BlockSolver = solve_block_exact,
     seed: int = 0,
     verbose: bool = True,
+    day_solver: BlockSolver | None = None,
+    day_share: float = 0.5,
 ) -> dict:
     """Clamp-and-iterate, then repeated kicks + local re-optimisation (keep if better).
 
     After a kick only the kicked days and their neighbours are re-optimised (they
-    are the only blocks whose surroundings changed); every ``full_every`` accepted
-    improvements a full sweep runs as well.
+    are the only blocks whose surroundings changed); after an accepted kick a full
+    sweep runs as well.
+
+    With ``day_solver`` (e.g. ``big_blocks.SABlockSolver``), whole-day blocks (all
+    assets of one day) are used too: first, whole-day sweeps alternate with small-block
+    sweeps until neither improves; then about ``day_share`` of the remaining time goes
+    to *day moves* (re-solve one random day, then its neighbourhood with small blocks)
+    instead of kicks.
     """
     rng = np.random.default_rng(seed)
     ev = BlockEvaluator(model)
@@ -362,11 +370,48 @@ def iterated_search(
     best_L, best_S, best = res["L"], res["S"], res["score"]
     start_score = best
     trace = [(round(time.time() - t0, 1), best)]
-    kicks = improvements = 0
+    kicks = improvements = day_moves = day_improvements = 0
     offset = 1000
+    deadline = t0 + time_limit
+    all_assets = [np.arange(len(model.symbols))]
+    whole_day = lambda sweep: all_assets  # noqa: E731
+    if day_solver is not None:
+        while time.time() < deadline:  # polish: whole days <-> small blocks
+            before = best
+            r = clamp_and_iterate(model, whole_day, day_solver, L=best_L, S=best_S, max_sweeps=20,
+                                  patience=1, verbose=False, deadline=deadline)
+            offset += 1
+            r = clamp_and_iterate(model, groups, solver, L=r["L"], S=r["S"], max_sweeps=50, patience=1,
+                                  verbose=False, sweep_offset=offset, deadline=deadline)
+            best_L, best_S, best = r["L"], r["S"], r["score"]
+            trace.append((round(time.time() - t0, 1), best))
+            if best >= before:
+                break
+    polish_score = best
+    t_day = t_kick = 0.0
     while time.time() - t0 < time_limit:
+        if day_solver is not None and t_day <= day_share * (t_day + t_kick):
+            t1 = time.time()
+            t = int(rng.integers(T))
+            r = clamp_and_iterate(model, whole_day, day_solver, L=best_L, S=best_S, max_sweeps=1,
+                                  patience=1, verbose=False, days_subset=[t], deadline=deadline)
+            day_moves += 1
+            if r["score"] < best:
+                offset += 1
+                near = [d for d in (t - 1, t, t + 1) if 0 <= d < T]
+                r = clamp_and_iterate(model, groups, solver, L=r["L"], S=r["S"], max_sweeps=50, patience=1,
+                                      verbose=False, days_subset=near, sweep_offset=offset, deadline=deadline)
+                best_L, best_S, best = r["L"], r["S"], r["score"]
+                day_improvements += 1
+                trace.append((round(time.time() - t0, 1), best))
+                if verbose:
+                    print(f"  {time.time() - t0:6.1f}s  day move {day_moves}: {best}", flush=True)
+            t_day += time.time() - t1
+            continue
+        t1 = time.time()
         L2, S2, kdays = kick(model, ev, best_L, best_S, rng, kick_blocks, kick_size)
         if not model.score_arrays(L2, S2).feasible:
+            t_kick += time.time() - t1
             continue
         near = sorted({d for t in kdays for d in (t - 1, t, t + 1) if 0 <= d < T})
         offset += 1
@@ -384,9 +429,11 @@ def iterated_search(
             trace.append((round(time.time() - t0, 1), best))
             if verbose:
                 print(f"  {time.time() - t0:6.1f}s  kick {kicks}: {best}", flush=True)
+        t_kick += time.time() - t1
     final = model.score_arrays(best_L, best_S)
     assert final.feasible and final.objective == best
-    return dict(score=best, start_score=start_score, kicks=kicks, improvements=improvements,
+    return dict(score=best, start_score=start_score, polish_score=polish_score, kicks=kicks,
+                improvements=improvements, day_moves=day_moves, day_improvements=day_improvements,
                 trace=trace, seconds=round(time.time() - t0, 1), L=best_L, S=best_S)
 
 
@@ -588,6 +635,12 @@ def add_solver_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--tqa-dt", type=float, default=1.0, help="TQA time step per layer")
     ap.add_argument("--qaoa-compare-exact", action="store_true",
                     help="diagnostic: also enumerate each block to count how often QAOA hits its optimum")
+    ap.add_argument("--day-blocks", action="store_true",
+                    help="also re-solve whole days (all assets) with integer SA (big_blocks.py)")
+    ap.add_argument("--day-chains", type=int, default=64, help="SA chains per whole-day block")
+    ap.add_argument("--day-sweeps", type=int, default=300, help="SA sweeps per whole-day block")
+    ap.add_argument("--day-share", type=float, default=0.5,
+                    help="share of the search time spent on whole-day moves instead of kicks")
 
 
 def make_solver(args):
@@ -620,13 +673,26 @@ def run_pipeline(model: qt.PortfolioModel, bkv, args) -> dict:
         print(f"  start (SA + fast repair): {fmt(info['score'])}", flush=True)
     groups = grouping_fn(model, args.size, args.methods[0])
     solver, describe = make_solver(args)
+    day_solver = None
+    if getattr(args, "day_blocks", False):
+        from big_blocks import SABlockSolver  # imports this module: keep it lazy
+
+        day_solver = SABlockSolver(chains=args.day_chains, sweeps=args.day_sweeps, seed=args.seed)
     r = iterated_search(model, groups, L=L, S=S, time_limit=args.time, kick_blocks=args.kick_blocks,
-                        kick_size=args.size, solver=solver, seed=args.seed, verbose=False)
+                        kick_size=args.size, solver=solver, seed=args.seed, verbose=False,
+                        day_solver=day_solver, day_share=getattr(args, "day_share", 0.5))
     rec["solver"] = describe()
+    if day_solver is not None:
+        rec["day_blocks"] = dict(day_solver.summary(), share=args.day_share, moves=r["day_moves"],
+                                 improvements=r["day_improvements"], polish_score=r["polish_score"])
     sc = model.score_arrays(r["L"], r["S"])
     assert sc.feasible and sc.objective == r["score"]
-    print(f"  blocks: {fmt(r['start_score'])} -> iterated search: {fmt(r['score'])} "
-          f"({r['kicks']} kicks, {r['improvements']} improvements); total {time.time() - t0:.0f}s", flush=True)
+    days_note = "" if day_solver is None else (
+        f" -> whole-day polish: {fmt(r['polish_score'])}")
+    print(f"  blocks: {fmt(r['start_score'])}{days_note} -> iterated search: {fmt(r['score'])} "
+          f"({r['kicks']} kicks, {r['improvements']} improvements"
+          + ("" if day_solver is None else f"; {r['day_moves']} day moves, {r['day_improvements']} improvements")
+          + f"); total {time.time() - t0:.0f}s", flush=True)
     rec.update(blocks=r["start_score"], score=r["score"], gap=gap(r["score"]), kicks=r["kicks"],
                improvements=r["improvements"], trace=r["trace"], seconds=round(time.time() - t0, 1))
     if rec["solver"]["name"] != "exact":
@@ -636,11 +702,12 @@ def run_pipeline(model: qt.PortfolioModel, bkv, args) -> dict:
     sol = Path(args.solutions) / f"{model.instance.name}_b{model.budget:03d}_l{lam_tag}.sol"
     model.write_solution(sol, model.to_positions(r["L"], r["S"]),
                          comment=f"asset groups of {args.size} ({args.methods[0]}), {rec['solver']['name']} block solver"
+                                 f"{' + whole-day SA blocks' if day_solver is not None else ''}"
                                  f" + iterated search, "
                                  f"{'empty' if args.no_sa else 'SA'} start")
     rec["solution_file"] = str(sol)
     Path(args.out).mkdir(parents=True, exist_ok=True)
-    tag = "" if rec["solver"]["name"] == "exact" else f"_{rec['solver']['name']}"
+    tag = ("" if rec["solver"]["name"] == "exact" else f"_{rec['solver']['name']}") + ("_days" if day_solver else "")
     out = Path(args.out) / f"pipeline_{model.instance.name}_B{model.budget}_lam{lam_tag}_seed{args.seed}{tag}.json"
     out.write_text(json.dumps(rec, indent=2, default=float))
     print(f"  wrote {sol} and {out}")
