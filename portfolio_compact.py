@@ -24,6 +24,20 @@ One *optional* restriction is not exact: ``budget_equality=True`` demands exactl
 optimum: the best-known ``po_a010_t10_orig`` solution at ``B = 4, λ = 1e-3`` holds
 0-4 units per period. (At ``λ = 1e-4`` it uses the full budget every period.)
 
+Optional *domain-wall* ordering (``domain_wall=w > 0``) is exact too. Per asset and
+period it adds ``w`` times
+
+    Σ_m  x[m+1]·(1 − x[m])   on the long copies and on the short copies (out of order)
+    + x_long[0]·x_short[0]                                       (long and short at once)
+
+to the objective, which is zero on canonical encodings. The unit copies then form a
+domain-wall (thermometer) encoding of the net position ``v ∈ [-ub, ub]``: one bit
+pattern per value. No state it penalises beats a valid one: sorting copies only
+lowers rebalancing, and replacing ``(L, S)`` by ``(max(v, 0), max(-v, 0))`` keeps
+risk, returns and interest, lowers fees, budget use and liquidation, and turns
+rebalancing into ``|Δv| <= |ΔL| + |ΔS|``. So any ``w >= 0`` keeps the optimum; ``w``
+only reshapes the landscape.
+
 Unit counts stay unary (one bit per unit copy). A binary count would be smaller, but
 the rebalancing cost ``tc * |L_t - L_{t-1}|`` is not quadratic in binary digits; in
 unary it is a sum of XORs, which is.
@@ -53,6 +67,8 @@ class CompactPortfolioQUBO:
             keeping it in the QUBO, with a warning, if it is too large to solve.
         budget_equality: Require exactly ``B`` open units per period and drop the
             budget slack. **Not exact**: a heuristic restriction.
+        domain_wall: Weight (score units) of the domain-wall ordering terms added to
+            the objective; ``0`` leaves them out (exact for any weight).
         last_period_max_configs: Size limit for enumerating the final period.
 
     Attributes:
@@ -61,6 +77,8 @@ class CompactPortfolioQUBO:
         periods: The periods represented in the QUBO.
         last_period: ``(long, short)`` arrays fixed for the final period, or ``None``.
         reductions: Which reductions were applied, and the variable count saved.
+        wall: The domain-wall terms at unit weight (zero on canonical encodings),
+            built whatever ``domain_wall`` is, e.g. to count invalid patterns.
     """
 
     def __init__(
@@ -71,6 +89,7 @@ class CompactPortfolioQUBO:
         tight_budget_slack: bool = True,
         decouple_last_period: bool = True,
         budget_equality: bool = False,
+        domain_wall: float = 0.0,
         last_period_max_configs: int = 200_000,
     ):
         self.model = model
@@ -131,7 +150,15 @@ class CompactPortfolioQUBO:
         self._y = lambda k, t: self.n_x + k * P + t
         self._s = lambda c, t: self.n_x + self.cash_bits * P + c * P + t
 
+        if domain_wall < 0:
+            raise ValueError("domain_wall must be >= 0")
+        self.domain_wall = float(domain_wall)
+        self.wall = self._build_wall()
         self.objective = self._build_objective()
+        if self.domain_wall:
+            scaled = self.wall.copy()
+            scaled.scale(self.domain_wall)
+            self.objective.update(scaled)
         self.penalty = self._build_penalty()
 
         official = (6 * n + model.cash_slack_bits + model.count_slack_bits) * T
@@ -141,6 +168,7 @@ class CompactPortfolioQUBO:
             "unit copies": f"{model.ub} -> {self.ub}",
             "last period solved apart": self.last_period is not None,
             "budget equality (heuristic)": budget_equality,
+            "domain-wall weight": self.domain_wall,
             "variables": f"{official} -> {self.n_vars}",
         }
 
@@ -255,6 +283,21 @@ class CompactPortfolioQUBO:
             np.concatenate(vals).astype(float) if vals else np.zeros(0),
         )
         return dimod.BinaryQuadraticModel.from_numpy_vectors(linear, quad, offset, dimod.BINARY)
+
+    def _build_wall(self) -> dimod.BinaryQuadraticModel:
+        """Domain-wall ordering terms at unit weight (see the module docstring)."""
+        n, ub, x = len(self.model.symbols), self.ub, self._x
+        bqm = dimod.BinaryQuadraticModel.from_numpy_vectors(
+            np.zeros(self.n_vars), ([], [], []), 0.0, dimod.BINARY
+        )
+        for t in self.periods:
+            for i in range(n):
+                for tau in (1, -1):
+                    for m in range(ub - 1):  # x[m+1] (1 - x[m])
+                        bqm.add_linear(x(i, m + 1, tau, t), 1.0)
+                        bqm.add_quadratic(x(i, m, tau, t), x(i, m + 1, tau, t), -1.0)
+                bqm.add_quadratic(x(i, 0, 1, t), x(i, 0, -1, t), 1.0)
+        return bqm
 
     def _build_penalty(self) -> dimod.BinaryQuadraticModel:
         model, n, ub = self.model, len(self.model.symbols), self.ub
