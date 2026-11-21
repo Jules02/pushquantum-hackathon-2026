@@ -2,8 +2,9 @@
 """Auto runner: execute a solver script on many QOBLIB portfolio instances (spec: AutoRunner.md).
 
     python auto_runner.py WORKER.py --tests local_size_tests            # test by name
-    python auto_runner.py WORKER.py --tests 0 4 --seed s01 --risk 6      # tests by index, seed, λ index
-    python auto_runner.py WORKER.py --tests all                          # every test, every seed
+    python auto_runner.py WORKER.py --tests 0 4 --seed s01 --risk 6      # tests by index, data seed, λ index
+    python auto_runner.py WORKER.py --tests 0 --solver-seeds 1 2 3       # multiple solver seeds (default: 1909)
+    python auto_runner.py WORKER.py --tests all                          # every test, every data seed
     python auto_runner.py WORKER.py --manual 12 20                       # rows of the QOBLIB table (--list)
     python auto_runner.py WORKER.py --tests cloud_size_tests --cloud     # Qoro cloud instead of local
     python auto_runner.py WORKER.py --list                               # tests, λ values, table rows
@@ -11,19 +12,23 @@
 
 WORKER contract
 ---------------
-The runner starts ``python WORKER.py`` once per instance, from the run directory
-``AutoData/<test>_<HHMM>/``, in its own terminal (or hidden with ``--silent``), with::
+The runner starts ``python WORKER.py`` once per (instance, solver seed), from a per-seed
+working directory under ``AutoData/<test>_<HHMM>/``, in its own terminal (or hidden with
+``--silent``), with::
 
     --instance po_a010_t10_orig_b004_l1e-4    full instance name
-    --data-dir ../../instances/po_a010_t10_orig   instance data, relative to the run directory
+    --data-dir ../../../instances/po_a010_t10_orig  instance data, relative to working directory
     --assets 10 --days 10 --lam 1e-4 --budget 4   parameters that define the instance
     --cloud false                                 true = run on Qoro's cloud
+    --seed 1909                                   solver RNG seed (also AUTORUNNER_SOLVER_SEED)
 
 The worker writes ``<instance>.sol`` into its working directory and reports, as one stdout line::
 
     AUTORUNNER_RESULT {"score": -69372, "best_sol": "po_a010_t10_orig_b004_l1e-4.sol", "extra": {...}}
 
 (or the same JSON in ``<instance>.result.json``). ``best_sol`` defaults to ``<instance>.sol``.
+When multiple ``--solver-seeds`` are supplied, only the best ``.sol`` per instance is kept in
+``AutoData/<test>_<HHMM>/<instance>.sol``, while scores for all seeds are recorded in the report JSON.
 """
 from __future__ import annotations
 
@@ -56,6 +61,7 @@ RESULT_MARKER = "AUTORUNNER_RESULT "
 # Risk λ, indexed 0..7 (spelled as in QOBLIB's file names, e.g. po_a010_t10_orig_b004_l1e-4.sol).
 RISKS = ["0", "1e-6", "1e-5", "5e-5", "1e-4", "5e-4", "1e-3", "1e-2"]
 DEFAULT_RISK = 4  # 1e-4
+DEFAULT_SOLVER_SEED = 1909
 SEEDS = ["orig", "s00", "s01", "s02"]  # data seeds that exist in instances/
 
 # The tests of AutoRunner.md, in its order (index = position). "XX" = --seed; entries without
@@ -305,16 +311,16 @@ def child_main(spec_path: str) -> int:
     print(f"[auto_runner] {spec['name']}  started {start}\n[auto_runner] {shlex.join(spec['cmd'])}\n", flush=True)
     try:
         with open(spec["log"], "w", encoding="utf-8") as log:
+            env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8", **(spec.get("env") or {})}
             proc = subprocess.Popen(spec["cmd"], cwd=spec["cwd"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, encoding="utf-8", errors="replace",
-                                    env={**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"})
+                                    text=True, encoding="utf-8", errors="replace", env=env)
             for line in proc.stdout:
                 log.write(line)
                 log.flush()
                 print(line, end="", flush=True)
-                if line.startswith(RESULT_MARKER):
+                if line.startswith(RESULT_MARKER.strip()):  # "AUTORUNNER_RESULT " or "AUTORUNNER_RESULT:"
                     try:
-                        result = json.loads(line[len(RESULT_MARKER):])
+                        result = json.loads(line[len(RESULT_MARKER.strip()):].lstrip(": "))
                     except json.JSONDecodeError:
                         pass
             code = proc.wait()
@@ -372,6 +378,10 @@ def kill_tree(proc) -> None:
 @dataclass
 class Running:
     task: Task
+    solver_seed: int
+    job_id: str
+    seed_cwd: Path
+    done_path: Path
     proc: subprocess.Popen | None
     tracks: bool
     start: str
@@ -428,14 +438,33 @@ class Resources:
         return self.cloud or sum(r.task.est_mb for r in running) + task.est_mb <= self.mem_budget_mb
 
 
+def worker_flags(worker: Path) -> dict[str, str]:
+    """Flag names this worker accepts (auto_worker.py style vs solver1.py style), read from its source."""
+    try:
+        src = worker.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        src = ""
+
+    def pick(*names: str) -> str:
+        return next((n for n in names if f'"{n}"' in src or f"'{n}'" in src), names[0])
+
+    return {"data": pick("--data-dir", "--instance-dir"),
+            "seed": pick("--seed", "--solver-seed"),
+            "lam": pick("--lam", "--lambda")}
+
+
 def run_test(test: str, tasks: list[Task], args, rows: list[dict]) -> Path | None:
     worker = Path(args.worker).resolve()
+    flags = worker_flags(worker)
     tasks = sorted(tasks, key=lambda t: t.n_vars, reverse=True)  # most complex first
+    solver_seeds: list[int] = list(args.solver_seeds)
+    multi_seed = len(solver_seeds) > 1
     res = Resources(cloud=args.cloud, max_parallel=args.max_parallel, low_credits=args.low_credits)
     res.assess()
 
-    print(f"\n=== {test}: {len(tasks)} instance(s), {'CLOUD' if args.cloud else 'local'}, "
-          f"{'silent' if args.silent else 'terminal windows'} ===\n    {res.info['decision']}")
+    print(f"\n=== {test}: {len(tasks)} instance(s) x {len(solver_seeds)} solver seed(s) {solver_seeds}, "
+          f"{'CLOUD' if args.cloud else 'local'}, {'silent' if args.silent else 'terminal windows'} ===\n"
+          f"    {res.info['decision']}")
     for t in tasks:
         data = "ok" if (INSTANCES_DIR / t.base).is_dir() else "MISSING"
         print(f"  {t.name:32s} {t.n_vars:6d} vars  ~{t.subprograms:5d} sub-programs  ~{t.circuits:9,d} circuits  "
@@ -450,64 +479,84 @@ def run_test(test: str, tasks: list[Task], args, rows: list[dict]) -> Path | Non
     (run_dir / "_tasks").mkdir(parents=True)
     print(f"    results: {run_dir}")
 
-    pending, running, finished = list(tasks), [], {}
+    task_by_name = {t.name: t for t in tasks}
+    pending: list[tuple[Task, int]] = [(t, s) for t in tasks for s in solver_seeds]
+    running: list[Running] = []
+    seed_results: dict[str, dict[int, dict]] = {t.name: {} for t in tasks}
+    finished: dict[str, dict] = {}
     silent, interrupted = args.silent, False
     try:
         while pending or running:
             for r in list(running):
-                done = run_dir / f"{r.task.name}.done.json"
-                if done.exists():
-                    finished[r.task.name] = collect(r, json.loads(done.read_text(encoding="utf-8")), run_dir, args, rows)
-                    running.remove(r)
+                done_data = None
+                if r.done_path.exists():
+                    done_data = json.loads(r.done_path.read_text(encoding="utf-8"))
                 elif r.tracks and r.proc is not None and r.proc.poll() is not None:
                     r.gone_since = r.gone_since or time.time()
                     if time.time() - r.gone_since > 10:  # window closed before the task finished
-                        finished[r.task.name] = collect(r, {"exit_code": None, "start": r.start, "end": now(),
-                                                            "error": "terminal closed before the task finished"},
-                                                        run_dir, args, rows)
-                        running.remove(r)
-            while pending and res.fits(pending[0], running):
-                task = pending.pop(0)
+                        done_data = {"exit_code": None, "start": r.start, "end": now(),
+                                     "error": "terminal closed before the task finished"}
+                if done_data is not None:
+                    seed_results[r.task.name][r.solver_seed] = collect_seed(r, done_data, args, rows)
+                    running.remove(r)
+                    if len(seed_results[r.task.name]) == len(solver_seeds):
+                        finished[r.task.name] = finalize_instance(
+                            r.task, solver_seeds, seed_results[r.task.name], run_dir, rows
+                        )
+            while pending and res.fits(pending[0][0], running):
+                task, solver_seed = pending.pop(0)
+                job_id = f"{task.name}_seed{solver_seed}"
+                label = job_id if multi_seed else task.name
+                seed_cwd = run_dir / "_seeds" / job_id
+                seed_cwd.mkdir(parents=True, exist_ok=True)
+                done_path = run_dir / "_tasks" / f"{job_id}.done.json"
                 spec = {
-                    "name": task.name, "cwd": str(run_dir), "silent": silent,
-                    "log": str(run_dir / f"{task.name}.log"), "done": str(run_dir / f"{task.name}.done.json"),
+                    "name": label, "cwd": str(seed_cwd), "silent": silent,
+                    "log": str(run_dir / f"{label}.log"), "done": str(done_path),
+                    "env": {"AUTORUNNER_SOLVER_SEED": str(solver_seed)},
                     "cmd": [sys.executable, str(worker),
                             "--instance", task.name,
-                            "--data-dir", os.path.relpath(INSTANCES_DIR / task.base, run_dir),
+                            flags["data"], os.path.relpath(INSTANCES_DIR / task.base, seed_cwd),
                             "--assets", str(task.assets), "--days", str(task.days),
-                            "--lam", task.lam, "--budget", str(task.budget),
-                            "--cloud", "true" if args.cloud else "false"],
+                            flags["lam"], task.lam, "--budget", str(task.budget),
+                            "--cloud", "true" if args.cloud else "false",
+                            flags["seed"], str(solver_seed)],
                 }
-                spec_path = run_dir / "_tasks" / f"{task.name}.json"
+                spec_path = run_dir / "_tasks" / f"{job_id}.json"
                 spec_path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
                 child = [sys.executable, str(Path(__file__).resolve()), "--_child", str(spec_path)]
-                proc, tracks = (None, True) if silent else open_terminal(child, run_dir)
+                proc, tracks = (None, True) if silent else open_terminal(child, seed_cwd)
                 if proc is None:
                     if not silent:
                         print("[auto_runner] no terminal window available: continuing silently")
                         silent = True
-                    proc = subprocess.Popen(child, cwd=run_dir, stdin=subprocess.DEVNULL,
+                    proc = subprocess.Popen(child, cwd=seed_cwd, stdin=subprocess.DEVNULL,
                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 before = (credit_status() or {}).get("total_used") if args.cloud else None
-                r = Running(task, proc, tracks, now(), before, overlapped=bool(running))
+                r = Running(task, solver_seed, job_id, seed_cwd, done_path, proc, tracks, now(),
+                            before, overlapped=bool(running))
                 for other in running:
                     other.overlapped = True
                 running.append(r)
-                print(f"[{now()}] started  {task.name}  ({len(running)} running, {len(pending)} queued)")
+                print(f"[{now()}] started  {label}  ({len(running)} running, {len(pending)} queued)")
             time.sleep(2)
     except KeyboardInterrupt:
         interrupted = True
-        print(f"\n[auto_runner] Ctrl+C: stopping {len(running)} running instance(s)")
+        print(f"\n[auto_runner] Ctrl+C: stopping {len(running)} running job(s)")
         for r in running:
             kill_tree(r.proc)
+
+    for name, per_seed in seed_results.items():
+        if name not in finished and per_seed:
+            finished[name] = finalize_instance(task_by_name[name], solver_seeds, per_seed, run_dir, rows)
 
     # Final JSON: TYPE_TIME.json, TIME = hour and minute when all outputs are done; never overwritten.
     report = {
         "test": test,
         "instances": [t.name for t in tasks],
         "settings": {"worker": str(worker), "local": not args.cloud, "silent": args.silent, "seed": args.seed,
-                     "risk": RISKS[args.risk], "manual": args.manual, "python": sys.executable,
-                     "platform": platform.platform(), "interrupted": interrupted},
+                     "solver_seeds": solver_seeds, "risk": RISKS[args.risk], "manual": args.manual,
+                     "python": sys.executable, "platform": platform.platform(), "interrupted": interrupted},
         "results": {t.name: finished.get(t.name) for t in tasks},
         "extra": {"resources": res.info},
     }
@@ -522,48 +571,135 @@ def run_test(test: str, tasks: list[Task], args, rows: list[dict]) -> Path | Non
     return json_path
 
 
-def collect(r: Running, done: dict, run_dir: Path, args, rows: list[dict]) -> dict:
-    """One instance's block for the final JSON."""
+def _seed_rank(rec: dict) -> tuple:
+    """Sort key for picking the best solver seed (lower tuple is better)."""
+    sol_path = rec.get("_sol_path")
+    has_sol = sol_path is not None and Path(sol_path).exists()
+    chk = rec.get("checker") or {}
+    feasible = chk.get("feasible") is True
+    obj = chk.get("objective")
+    if obj is None:
+        obj = rec.get("score")
+    has_obj = obj is not None
+    return (
+        0 if (feasible and has_sol) else 1,
+        0 if has_sol else 1,
+        0 if has_obj else 1,
+        obj if has_obj else float("inf"),
+    )
+
+
+def collect_seed(r: Running, done: dict, args, rows: list[dict]) -> dict:
+    """Collect the result of one (instance, solver_seed) run."""
     task, result = r.task, done.get("result")
-    if result is None and (path := run_dir / f"{task.name}.result.json").exists():
+    if result is None and (path := r.seed_cwd / f"{task.name}.result.json").exists():
         try:
             result = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             result = None
-    block = {"start": done.get("start", r.start), "end": done.get("end"), "exit_code": done.get("exit_code")}
+    block = {
+        "solver_seed": r.solver_seed,
+        "start": done.get("start", r.start),
+        "end": done.get("end"),
+        "exit_code": done.get("exit_code"),
+    }
     if args.cloud:
         after = (credit_status() or {}).get("total_used")
         block["credits_used"] = ({"value": after - r.credits_used_before, "approximate": r.overlapped}
                                  if after is not None and r.credits_used_before is not None else None)
     best_sol = (result or {}).get("best_sol") or f"{task.name}.sol"
-    sol_path = run_dir / best_sol
-    block["best_sol"] = best_sol if sol_path.exists() else None
+    sol_path = r.seed_cwd / best_sol
+    block["_sol_path"] = str(sol_path) if sol_path.exists() else None
+    block["_seed_cwd"] = str(r.seed_cwd)
     block["score"] = (result or {}).get("score")
     block["checker"] = run_checker(sol_path) if sol_path.exists() else None
-    block["best_known"] = best_known(task, rows)
+    bkv = best_known(task, rows)["value"]
     objective = (block["checker"] or {}).get("objective")
     if objective is None:
         objective = block["score"]
-    bkv = block["best_known"]["value"]
     block["gap"] = (objective - bkv) / abs(bkv) if objective is not None and bkv not in (None, 0) else None
     if done.get("error") or (result is None and done.get("exit_code") != 0):
         block["error"] = done.get("error") or f"worker exit code {done.get('exit_code')}, no result reported"
     block["extra"] = (result or {}).get("extra")
     gap = "" if block["gap"] is None else f"  gap {block['gap']:+.2%}"
-    print(f"[{now()}] finished {task.name}: score {block['score']}, best known {bkv}{gap}")
+    print(f"[{now()}] finished {task.name} (seed {r.solver_seed}): score {block['score']}, best known {bkv}{gap}")
+    return block
+
+
+def finalize_instance(task: Task, solver_seeds: list[int], per_seed: dict[int, dict],
+                      run_dir: Path, rows: list[dict]) -> dict:
+    """Keep only the best .sol file across solver seeds, while preserving scores for all seeds."""
+    ordered = [(s, per_seed[s]) for s in solver_seeds if s in per_seed]
+    best_seed, best_rec = min(ordered, key=lambda item: _seed_rank(item[1]))
+
+    final_sol_name = f"{task.name}.sol"
+    final_sol_path = run_dir / final_sol_name
+    win_sol = best_rec.get("_sol_path")
+    if win_sol and Path(win_sol).exists():
+        shutil.copy2(win_sol, final_sol_path)
+
+    # Remove all per-seed .sol files so only the best solution file is saved.
+    for _, rec in ordered:
+        seed_cwd = rec.pop("_seed_cwd", None)
+        rec.pop("_sol_path", None)
+        if seed_cwd:
+            for sol_file in Path(seed_cwd).glob("*.sol"):
+                sol_file.unlink(missing_ok=True)
+
+    scores_by_seed = {}
+    solver_seed_records = {}
+    for s, rec in ordered:
+        score_val = rec.get("score")
+        if score_val is None:
+            score_val = (rec.get("checker") or {}).get("objective")
+        scores_by_seed[str(s)] = score_val
+        solver_seed_records[str(s)] = rec
+
+    block = {
+        "start": best_rec.get("start"),
+        "end": best_rec.get("end"),
+        "exit_code": best_rec.get("exit_code"),
+        "best_solver_seed": best_seed,
+        "best_sol": final_sol_name if final_sol_path.exists() else None,
+        "score": best_rec.get("score"),
+        "scores_by_seed": scores_by_seed,
+        "checker": best_rec.get("checker"),
+        "best_known": best_known(task, rows),
+        "gap": best_rec.get("gap"),
+        "solver_seeds": solver_seed_records,
+        "extra": best_rec.get("extra"),
+    }
+    if "credits_used" in best_rec:
+        block["credits_used"] = best_rec["credits_used"]
+    if "error" in best_rec:
+        block["error"] = best_rec["error"]
+    if len(ordered) > 1:
+        print(f"[{now()}] best for {task.name}: seed {best_seed} (score {block['score']}), "
+              f"all seeds: {scores_by_seed}")
     return block
 
 
 def print_summary(report: dict) -> None:
-    print(f"\n{'instance':34s} {'score':>11s} {'checker':>11s} {'best known':>11s} {'gap':>9s}  feasible")
+    multi_seed = len(report.get("settings", {}).get("solver_seeds") or []) > 1
+    if multi_seed:
+        print(f"\n{'instance':34s} {'best_seed':>9s} {'score':>11s} {'checker':>11s} {'best known':>11s} {'gap':>9s}  feasible")
+    else:
+        print(f"\n{'instance':34s} {'score':>11s} {'checker':>11s} {'best known':>11s} {'gap':>9s}  feasible")
     for name, b in report["results"].items():
         if not b:
             print(f"{name:34s}  (not run)")
             continue
         chk = b.get("checker") or {}
         gap = "" if b.get("gap") is None else f"{b['gap']:+.2%}"
-        print(f"{name:34s} {str(b.get('score')):>11s} {str(chk.get('objective')):>11s} "
-              f"{str(b['best_known']['value']):>11s} {gap:>9s}  {chk.get('feasible')}")
+        if multi_seed:
+            print(f"{name:34s} {str(b.get('best_solver_seed')):>9s} {str(b.get('score')):>11s} "
+                  f"{str(chk.get('objective')):>11s} {str(b['best_known']['value']):>11s} {gap:>9s}  {chk.get('feasible')}")
+            if b.get("scores_by_seed"):
+                per = ", ".join(f"{s}:{v}" for s, v in b["scores_by_seed"].items())
+                print(f"    all seeds: {per}")
+        else:
+            print(f"{name:34s} {str(b.get('score')):>11s} {str(chk.get('objective')):>11s} "
+                  f"{str(b['best_known']['value']):>11s} {gap:>9s}  {chk.get('feasible')}")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────────────
@@ -594,6 +730,8 @@ def main(argv: list[str] | None = None) -> int:
                    "optionally ROW:RISK; ignores --tests/--seed/--risk")
     p.add_argument("--silent", action="store_true", help="no terminal windows")
     p.add_argument("--seed", default="orig", choices=SEEDS, help="data seed for XX (default orig)")
+    p.add_argument("--solver-seeds", nargs="+", type=int, default=[DEFAULT_SOLVER_SEED], metavar="SEED",
+                   help=f"solver RNG seed(s) passed to worker via --seed (default: {DEFAULT_SOLVER_SEED})")
     p.add_argument("--cloud", action="store_true", help="run on Qoro's cloud with credits (default: local)")
     p.add_argument("--risk", type=int, default=DEFAULT_RISK, choices=range(len(RISKS)), metavar="0-7",
                    help=f"λ index into {RISKS} (default {DEFAULT_RISK} = {RISKS[DEFAULT_RISK]})")
@@ -602,6 +740,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dry-run", action="store_true", help="show tasks, resource plan and best-known values only")
     p.add_argument("--list", action="store_true", help="list tests, λ values and the CSV rows")
     args = p.parse_args(argv)
+    args.solver_seeds = list(dict.fromkeys(args.solver_seeds))
 
     rows = load_csv()
     if args.list:
