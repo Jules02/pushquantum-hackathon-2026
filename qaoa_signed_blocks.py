@@ -18,6 +18,10 @@ one with the largest margin.
     python qaoa_signed_blocks.py --blocks 4 --group 6          # local Maestro
     python qaoa_signed_blocks.py --blocks 1 --group 8 --cloud  # Qoro cloud (credits)
 
+QAOA starts from TQA angles by default (``--init random`` for Divi's uniform start).
+On a050 λ1e-3, 8 blocks of 12 qubits, p=2: TQA found the block optimum in its top
+64 samples on 6/8 blocks vs 4/8 for random (one seed).
+
 On the cloud each COBYLA step is one round trip (~20 s): 40 steps at 24 qubits took
 14 min and 16.9 credits. Use a batched optimiser there (e.g. MonteCarloOptimizer).
 """
@@ -119,6 +123,19 @@ def decode(bits: np.ndarray, W, C) -> np.ndarray:
     return np.einsum("kgj,gj->kg", bits.reshape(len(bits), g, 3), W).astype(int) + C.astype(int)
 
 
+def tqa_params(p: int, dt: float = 1.0) -> np.ndarray:
+    """TQA start (linear ramp, total time ``p*dt``) in Divi's layout [γ0, β0, γ1, β1, …].
+
+    γ ramps up, β ramps down; β is negative because Divi's mixer is +ΣX. Same
+    construction as ``init_test.py`` on the initialization-comparisons branch.
+    """
+    s = (np.arange(p) + 0.5) / p
+    row = np.empty(2 * p)
+    row[0::2] = s * dt
+    row[1::2] = -(1 - s) * dt
+    return row
+
+
 def lagrange_mu(Vall, cost, ok):
     """Smallest mu >= 0 whose unconstrained (units-priced) optimum is feasible.
 
@@ -203,7 +220,10 @@ def run(args):
         q = QAOA(BinaryOptimizationProblem(bqm_n), n_layers=args.layers,
                  optimizer=ScipyOptimizer(method=ScipyMethod.COBYLA),
                  max_iterations=args.iters, backend=backend, seed=args.seed)
-        q.run()
+        if args.init == "tqa":
+            q.run(initial_params=tqa_params(args.layers, args.tqa_dt).reshape(q.get_expected_param_shape()))
+        else:  # Divi's default: uniform random angles
+            q.run()
         secs = time.time() - t0
         tops = q.get_top_solutions(n=args.top)
         qb = np.array([[int(ch) for ch in s.bitstring] for s in tops])
@@ -229,7 +249,7 @@ def run(args):
     if args.cloud:
         bal1 = service.get_credit_balance()
         print("credits after:", bal1, flush=True)
-    out = f"results/qaoa_signed_{args.instance}_B{args.budget}_lam{args.lam}_g{args.group}_p{args.layers}_{'cloud' if args.cloud else 'local'}.json"
+    out = f"results/qaoa_signed_{args.instance}_B{args.budget}_lam{args.lam}_g{args.group}_p{args.layers}_{'cloud' if args.cloud else 'local'}{'' if args.init == 'random' else '_' + args.init}.json"
     json.dump(dict(vars(args), rows=rows), open(out, "w"), indent=1)
     print("wrote", out)
 
@@ -287,6 +307,9 @@ if __name__ == "__main__":
     ap.add_argument("--shots", type=int, default=10000)
     ap.add_argument("--top", type=int, default=64)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--init", choices=["tqa", "random"], default="tqa",
+                    help="QAOA starting angles: TQA ramp (default) or Divi's uniform random")
+    ap.add_argument("--tqa-dt", type=float, default=1.0, help="TQA time step per layer")
     ap.add_argument("--cloud", action="store_true")
     ap.add_argument("--check", action="store_true", help="brute-force exactness check, no QAOA")
     a = ap.parse_args()
