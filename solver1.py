@@ -670,45 +670,126 @@ class TorchGPUCircuitRunner(CircuitRunner):
             )
         return out
 
+    @staticmethod
+    def _resolve_per_circuit_ham_ops(
+        n_circuits: int,
+        ham_ops: str | None,
+        circuit_ham_map: Any | None,
+    ) -> list[str] | None:
+        """Resolve each circuit's semicolon-separated observable group string."""
+        if ham_ops is None:
+            return None
+        groups = [g.strip() for g in ham_ops.split("|")]
+        if circuit_ham_map is None:
+            combined = ";".join(g for g in groups if g)
+            return [combined] * n_circuits
+        if len(circuit_ham_map) != len(groups):
+            raise ValueError(
+                f"circuit_ham_map length ({len(circuit_ham_map)}) must match "
+                f"number of ham_ops groups ({len(groups)})."
+            )
+        per_circuit: list[str | None] = [None] * n_circuits
+        for group_str, (start, end) in zip(groups, circuit_ham_map):
+            for idx in range(start, end):
+                per_circuit[idx] = group_str
+        if any(g is None for g in per_circuit):
+            raise ValueError("circuit_ham_map does not cover every circuit.")
+        return per_circuit  # type: ignore[return-value]
+
+    @staticmethod
+    def _encode_ham_ops(
+        per_circuit_ham: list[str],
+    ) -> tuple[str, list[list[int]] | None]:
+        """Re-encode per-circuit observable strings into ``(ham_ops, circuit_ham_map)``."""
+        groups: list[str] = []
+        ham_map: list[list[int]] = []
+        for idx, group_str in enumerate(per_circuit_ham):
+            if groups and groups[-1] == group_str:
+                ham_map[-1][1] = idx + 1
+            else:
+                groups.append(group_str)
+                ham_map.append([idx, idx + 1])
+        if len(groups) == 1:
+            return groups[0], None
+        return "|".join(groups), ham_map
+
+    @staticmethod
+    def _subset_shot_groups(
+        shot_groups: Any,
+        n_circuits: int,
+        indices: list[int],
+    ) -> list[list[int]]:
+        """Slice ``shot_groups`` ``[start, end, shots]`` triples for a fallback subset."""
+        per_circuit_shots: list[int | None] = [None] * n_circuits
+        for start, end, shots in shot_groups:
+            for idx in range(start, end):
+                per_circuit_shots[idx] = int(shots)
+        encoded: list[list[int]] = []
+        for new_idx, orig_idx in enumerate(indices):
+            shots = per_circuit_shots[orig_idx]
+            if shots is None:
+                continue
+            if encoded and encoded[-1][2] == shots and encoded[-1][1] == new_idx:
+                encoded[-1][1] = new_idx + 1
+            else:
+                encoded.append([new_idx, new_idx + 1, shots])
+        return encoded
+
     def submit_circuits(
-        self, circuits, ham_ops: str | None = None, **kwargs
+        self,
+        circuits,
+        ham_ops: str | None = None,
+        circuit_ham_map=None,
+        **kwargs,
     ) -> ExecutionResult:
         if isinstance(circuits, dict):
             items = list(circuits.items())
         else:
             items = [(str(i), c) for i, c in enumerate(circuits)]
 
-        terms: list[str] | None = None
-        if ham_ops is not None and not self._force_sampling:
-            terms = [t.strip() for t in ham_ops.split(";") if t.strip()]
+        n_circuits = len(items)
+        per_circuit_ham = self._resolve_per_circuit_ham_ops(
+            n_circuits, ham_ops, circuit_ham_map
+        )
+        eval_expvals = per_circuit_ham is not None and not self._force_sampling
 
-        # Group structurally identical circuits so all parameter sets execute in one GPU batch
-        groups: dict[tuple, list[tuple[str, list[tuple[str, tuple[int, ...], tuple[float, ...]]]]]] = defaultdict(list)
-        fallback_items: dict[str, Any] = {}
+        # Group structurally identical circuits (and matching observable groups)
+        # so all parameter sets execute in one GPU batch.
+        groups: dict[
+            tuple,
+            list[tuple[str, list[tuple[str, tuple[int, ...], tuple[float, ...]]]]],
+        ] = defaultdict(list)
+        fallback_entries: list[tuple[int, str, Any, str | None]] = []
 
-        for label, circ in items:
+        for idx, (label, circ) in enumerate(items):
+            ham_str = per_circuit_ham[idx] if per_circuit_ham is not None else None
             parsed = _parse_openqasm_circuit(circ)
             if parsed is None or parsed[0] > self._max_qubits:
-                fallback_items[label] = circ
+                fallback_entries.append((idx, label, circ, ham_str))
                 continue
             n_qubits, ops = parsed
-            sig = (n_qubits, tuple((name, qubits) for name, qubits, _ in ops))
+            if eval_expvals and ham_str is not None:
+                circuit_terms = [t.strip() for t in ham_str.split(";") if t.strip()]
+                if any(len(t) != n_qubits for t in circuit_terms):
+                    # Mismatched qubit width: delegate cleanly to MaestroSimulator
+                    fallback_entries.append((idx, label, circ, ham_str))
+                    continue
+            sig = (
+                n_qubits,
+                tuple((name, qubits) for name, qubits, _ in ops),
+                ham_str if eval_expvals else None,
+            )
             groups[sig].append((label, ops))
 
         results_by_label: dict[str, dict[str, Any]] = {}
 
         with torch.no_grad():
-            for (n_qubits, _), grp in groups.items():
+            for (n_qubits, _, ham_str), grp in groups.items():
                 labels = [lbl for lbl, _ in grp]
                 batch_ops = [ops for _, ops in grp]
                 re, im = self._simulate_batch(n_qubits, batch_ops)
-                if terms is not None:
-                    matching_terms = [t for t in terms if len(t) == n_qubits]
-                    if len(matching_terms) != len(terms):
-                        # Mismatched qubit width: delegate cleanly to MaestroSimulator
-                        for lbl in labels:
-                            fallback_items[lbl] = dict(items)[lbl]
-                        continue
+                if eval_expvals and ham_str is not None:
+                    terms = [t.strip() for t in ham_str.split(";") if t.strip()]
                     exp_list = self._compute_expvals(re, im, n_qubits, terms)
                     for lbl, res_dict in zip(labels, exp_list):
                         results_by_label[lbl] = {"label": lbl, "results": res_dict}
@@ -717,8 +798,26 @@ class TorchGPUCircuitRunner(CircuitRunner):
                     for lbl, res_dict in zip(labels, cnt_list):
                         results_by_label[lbl] = {"label": lbl, "results": res_dict}
 
-        if fallback_items:
-            fb_res = self._fallback.submit_circuits(fallback_items, ham_ops=ham_ops, **kwargs)
+        if fallback_entries:
+            fallback_entries.sort(key=lambda e: e[0])
+            fallback_items = {lbl: circ for _, lbl, circ, _ in fallback_entries}
+            fb_kwargs = dict(kwargs)
+            fb_ham_ops: str | None = None
+            if per_circuit_ham is not None:
+                fb_ham_ops, fb_ham_map = self._encode_ham_ops(
+                    [h for _, _, _, h in fallback_entries if h is not None]
+                )
+                if fb_ham_map is not None:
+                    fb_kwargs["circuit_ham_map"] = fb_ham_map
+            if "shot_groups" in fb_kwargs and fb_kwargs["shot_groups"] is not None:
+                fb_kwargs["shot_groups"] = self._subset_shot_groups(
+                    fb_kwargs["shot_groups"],
+                    n_circuits,
+                    [idx for idx, _, _, _ in fallback_entries],
+                )
+            fb_res = self._fallback.submit_circuits(
+                fallback_items, ham_ops=fb_ham_ops, **fb_kwargs
+            )
             for entry in fb_res.results:
                 results_by_label[entry["label"]] = entry
 
