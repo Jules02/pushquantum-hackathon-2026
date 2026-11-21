@@ -113,7 +113,9 @@ def main(argv=None) -> int:
                                    qaoa_layers=args.qaoa_layers, qaoa_iters=args.qaoa_iters,
                                    qaoa_shots=args.qaoa_shots, qaoa_top=args.qaoa_top,
                                    qaoa_init=args.qaoa_init, tqa_dt=args.tqa_dt,
-                                   qaoa_compare_exact=args.qaoa_compare_exact)
+                                   qaoa_compare_exact=args.qaoa_compare_exact,
+                                   day_blocks=args.day_blocks, day_chains=args.day_chains,
+                                   day_sweeps=args.day_sweeps, day_share=args.day_share)
     rec = run_pipeline(model, bkv, pipe_args)
     sol = Path(rec["solution_file"])
     if sol.name != f"{args.instance}.sol":  # run_pipeline names it <po_base>_bBBB_l<lam>.sol
