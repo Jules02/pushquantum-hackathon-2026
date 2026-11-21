@@ -3,7 +3,15 @@
 
 # Created when you run the notebooks
 qoblib_data/
+AutoData/
 *.sol
 __pycache__/
 .ipynb_checkpoints/
 .DS_Store
+
+# Venvs
+qoro_venv/
+# Hand-in solutions are tracked
+!handin/*.sol
+# AutoRunner
+AutoData/

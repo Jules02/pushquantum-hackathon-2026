@@ -100,6 +100,50 @@ def check_exhaustive(model: qt.PortfolioModel, q: CompactPortfolioQUBO) -> None:
     print(f"  exhaustive over 2^{q.n_vars} bitstrings: QUBO min {best:g} == exact optimum {opt}")
 
 
+def check_domain_wall_terms(model: qt.PortfolioModel, weight: float, trials: int) -> None:
+    """Domain-wall terms: zero on canonical encodings, positive on every invalid slot."""
+    q = CompactPortfolioQUBO(model, domain_wall=weight)
+    base = CompactPortfolioQUBO(model)
+    for _ in range(trials):
+        L, S = with_last(model, q, *random_feasible(model))
+        L, S = np.where(L > S, L - S, 0), np.where(S > L, S - L, 0)  # one direction per slot
+        bits = q.encode(model.to_positions(L, S))
+        assert energy(q.wall, bits) == 0
+        assert energy(q.objective, bits) == energy(base.objective, bits)
+        # Random position bits: the wall energy counts the slots out of domain-wall form.
+        rnd = bits.copy()
+        rnd[: q.n_x] = rng.integers(0, 2, q.n_x)
+        bad = 0
+        for i in range(len(model.symbols)):
+            for t in q.periods:
+                lo = [rnd[q._x(i, m, 1, t)] for m in range(q.ub)]
+                sh = [rnd[q._x(i, m, -1, t)] for m in range(q.ub)]
+                ordered = lambda c: all(c[m] >= c[m + 1] for m in range(q.ub - 1))
+                bad += (not ordered(lo)) or (not ordered(sh)) or (lo[0] and sh[0])
+        assert (energy(q.wall, rnd) > 0) == (bad > 0)
+        diff = energy(q.objective, rnd) - energy(base.objective, rnd)
+        assert np.isclose(diff, weight * energy(q.wall, rnd))
+
+
+def check_netting(model: qt.PortfolioModel, trials: int) -> None:
+    """Holding long and short at once never beats holding the net position."""
+    tested = 0
+    for _ in range(trials):
+        L, S = random_feasible(model)
+        for t in range(model.n_periods):  # one hedged pair per period where it fits
+            i = rng.integers(len(model.symbols))
+            if (L[t] + S[t]).sum() + 2 <= model.budget and max(L[t, i], S[t, i]) < model.ub:
+                L[t, i] += 1
+                S[t, i] += 1
+        if not ((L > 0) & (S > 0)).any() or not model.score_arrays(L, S).feasible:
+            continue
+        tested += 1
+        v = L - S
+        assert model.score_arrays(np.maximum(v, 0), np.maximum(-v, 0)).objective <= \
+            model.score_arrays(L, S).objective
+    assert tested >= trials // 2, f"only {tested}/{trials} trials tested"
+
+
 def main() -> None:
     print("1. Tiny notebook instance (po_a003_t02_orig, B=3, λ=1e-5)")
     tiny = qt.PortfolioModel(qt.load_portfolio_instance("po_a003_t02_orig"), budget=3, lam="1e-5")
@@ -145,6 +189,19 @@ def main() -> None:
         pe = energy(qe.penalty, qe.encode(pos))
         print(f"      budget_equality=True ({qe.n_vars} vars): reference "
               f"{'still feasible' if pe == 0 else 'EXCLUDED (not every period uses the full budget)'}")
+
+    print("\n4. Domain-wall ordering (exact for any weight)")
+    model = qt.PortfolioModel(base, budget=4, lam="1e-4")
+    for w in (30.0, 300.0):
+        check_domain_wall_terms(model, w, trials=50)
+    check_netting(model, trials=300)
+    check_netting(qt.PortfolioModel(base, budget=4, lam="1e-3"), trials=300)
+    print("   terms zero on canonical encodings, positive exactly on invalid slots; netting never worse")
+    small = sliced(base, 2, 3)  # 2 periods in the QUBO, so rebalancing is exercised
+    for B, lam, ub in [(2, "1e-4", 2), (3, "1e-3", 2), (3, "1e-4", 2)]:
+        m = qt.PortfolioModel(small, budget=B, lam=lam, ub=ub)
+        for w in (0.0, 30.0, 300.0, 1e4):
+            check_exhaustive(m, CompactPortfolioQUBO(m, domain_wall=w))
 
     print("\nAll checks passed.")
 
