@@ -28,7 +28,7 @@ solution is scored, and notebook 00, *Handing in*, says what to hand in.
 2. **API key.** In Colab's left sidebar, click the key icon, add a secret named `QORO_API_KEY` with your
    key as its value, and switch on notebook access. Secrets belong to your Google account, so you add it
    once and switch on access in each notebook.
-3. **Install.** Run the notebook's first setup cell. It installs Divi 0.16.1 if it is missing; if it
+3. **Install.** Run the notebook's first setup cell. It installs Divi 0.16.2 if it is missing; if it
    installs anything, restart the session (Runtime → Restart session) and run from the top. Notebooks 01
    and 02 also download the helper file `qoblib_tools.py` in their setup.
 4. **To keep your changes,** save a copy to your Drive (File → Save a copy in Drive).
