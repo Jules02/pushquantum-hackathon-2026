@@ -2,6 +2,8 @@
 """``auto_runner.py`` worker for our pipeline (SA start -> asset-group blocks -> iterated search).
 
     python auto_runner.py auto_worker.py --tests local_size_tests --silent --worker-args "--time 300"
+    python auto_runner.py auto_worker.py --tests local_size_tests --silent \
+        --worker-args "--solver qaoa --size 4 --time 600"   # QAOA blocks, TQA start
 
 The runner calls this once per instance from its run directory with
 
@@ -9,10 +11,11 @@ The runner calls this once per instance from its run directory with
     --assets 50 --days 10 --lam 1e-3 --budget 20 --cloud false  [pipeline options]
 
 and we write, in the working directory, ``<instance>.sol``, ``pipeline_*.json`` and
-``<instance>.result.json`` (``{"score", "best_sol", "extra"}``). The pipeline is classical,
-so ``--cloud`` is accepted and ignored. If ``--data-dir`` is missing, the instance is
-downloaded from QOBLIB. ``--postprocess`` does nothing (it is there so the runner's
-post-processing call succeeds).
+``<instance>.result.json`` (``{"score", "best_sol", "extra"}``). The default
+``--solver exact`` is classical; ``--solver qaoa`` (TQA start) runs its blocks on the
+local Maestro simulator, so ``--cloud`` is accepted and ignored. If ``--data-dir`` is
+missing, the instance is downloaded from QOBLIB. ``--postprocess`` does nothing (it is
+there so the runner's post-processing call succeeds).
 """
 from __future__ import annotations
 
@@ -27,7 +30,7 @@ REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO))
 
 import qoblib_tools as qt  # noqa: E402
-from asset_groups import run_pipeline  # noqa: E402
+from asset_groups import add_solver_args, run_pipeline  # noqa: E402
 
 
 def load_instance_dir(path: Path, name: str) -> qt.PortfolioInstance:
@@ -69,7 +72,8 @@ def main(argv=None) -> int:
     p.add_argument("--days", type=int)
     p.add_argument("--lam")
     p.add_argument("--budget", type=int)
-    p.add_argument("--cloud", default="false", help="ignored: the pipeline is classical")
+    p.add_argument("--cloud", default="false",
+                   help="ignored: QAOA blocks (--solver qaoa) run on the local Maestro simulator")
     # pipeline options (defaults as in `asset_groups.py pipeline`)
     p.add_argument("--size", type=int, default=5, help="asset-group size")
     p.add_argument("--method", default="contiguous",
@@ -80,6 +84,7 @@ def main(argv=None) -> int:
     p.add_argument("--sa-sweeps", type=int, default=2000)
     p.add_argument("--no-sa", action="store_true", help="start from an empty portfolio (use on a400)")
     p.add_argument("--seed", type=int, default=0)
+    add_solver_args(p)
     args = p.parse_args(argv)
     if args.postprocess:
         print("auto_worker: no post-processing")
@@ -104,7 +109,13 @@ def main(argv=None) -> int:
     pipe_args = argparse.Namespace(lam=args.lam, size=args.size, methods=[args.method], time=args.time,
                                    kick_blocks=args.kick_blocks, sa_reads=args.sa_reads,
                                    sa_sweeps=args.sa_sweeps, no_sa=args.no_sa, seed=args.seed,
-                                   solutions=".", out=".")
+                                   solutions=".", out=".", solver=args.solver,
+                                   qaoa_layers=args.qaoa_layers, qaoa_iters=args.qaoa_iters,
+                                   qaoa_shots=args.qaoa_shots, qaoa_top=args.qaoa_top,
+                                   qaoa_init=args.qaoa_init, tqa_dt=args.tqa_dt,
+                                   qaoa_compare_exact=args.qaoa_compare_exact,
+                                   day_blocks=args.day_blocks, day_chains=args.day_chains,
+                                   day_sweeps=args.day_sweeps, day_share=args.day_share)
     rec = run_pipeline(model, bkv, pipe_args)
     sol = Path(rec["solution_file"])
     if sol.name != f"{args.instance}.sol":  # run_pipeline names it <po_base>_bBBB_l<lam>.sol

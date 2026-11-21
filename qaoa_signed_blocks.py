@@ -36,7 +36,7 @@ import dimod
 import numpy as np
 
 import qoblib_tools as qt
-from asset_groups import BlockEvaluator, _load, _net_configs, sa_start
+from asset_groups import BlockEvaluator, BlockResult, _load, _net_configs, sa_start
 
 CODES = np.array(list(itertools.product([0, 1], repeat=3)))  # (8, 3)
 SUBSETS = [(), (0,), (1,), (2,), (0, 1), (0, 2), (1, 2), (0, 1, 2)]
@@ -68,17 +68,22 @@ def _variants():
                         yield w, c, v, int(d)
 
 
-def block_qubo(ev: BlockEvaluator, L, S, t: int, G: np.ndarray, mu: float):
-    """BQM over 3|G| bits (bit 3i+j = bit j of asset G[i]) and the decoding (w, c)."""
+def block_qubo(ev: BlockEvaluator, L, S, t, G: np.ndarray, mu: float):
+    """BQM over 3|G| bits (bit 3i+j = bit j of asset G[i]) and the decoding (w, c).
+
+    ``t`` is a day or a run of consecutive days (the same holding on each, as in
+    ``BlockEvaluator.costs``).
+    """
     g = len(G)
-    A = ev.Rs[t][np.ix_(G, G)]
+    days = [t] if np.isscalar(t) else list(t)
+    A = sum(ev.Rs[d][np.ix_(G, G)] for d in days)
     vals = np.arange(-3, 4)
-    c0, _ = ev.costs(L, S, [t], G, np.zeros((1, g), int))
+    c0, _ = ev.costs(L, S, days, G, np.zeros((1, g), int))
     f = np.zeros((g, 7))
     for i in range(g):
         V = np.zeros((7, g), int)
         V[:, i] = vals
-        c, _ = ev.costs(L, S, [t], G, V)
+        c, _ = ev.costs(L, S, days, G, V)
         f[i] = c - c0[0] - A[i, i] * vals**2 + mu * np.abs(vals)
     W, C, margins, coefs = np.zeros((g, 3)), np.zeros(g), np.zeros(g), []
     for i in range(g):
@@ -160,6 +165,133 @@ def lagrange_mu(Vall, cost, ok):
     # broken toward fewer units; costs are integers, so 1e-3 * units never reorders others.
     hi += 1e-3
     return hi, opt(hi)
+
+
+class QAOABlockSolver:
+    """QAOA (TQA start by default) as the pipeline's block solver (``asset_groups.BlockSolver``).
+
+    Per block: build the signed 3-bit QUBO, run QAOA, decode the ``top`` most probable
+    samples and propose the best feasible one by true block cost; if none beats the
+    current holding, propose the current holding (the driver skips it). Nothing here
+    enumerates the block: the budget/cash price ``mu`` starts at 0 and is raised
+    (``mu_ladder`` x a per-block unit-cost scale) only when the lowest-energy sample
+    breaks a rule.
+
+    Results are cached on the block's surroundings (its days' full holdings and the
+    group's holdings on the neighbouring days), so the repeated sweeps of
+    clamp-and-iterate don't re-run QAOA on unchanged blocks; QAOA is seeded, so a cache
+    hit returns what a rerun would. ``compare_exact`` (diagnostic only, it enumerates
+    ``7**g`` holdings) records how often the proposal is the block optimum
+    (``exact_hits``) and how often QAOA's own samples contain it (``sample_hits``).
+    """
+
+    def __init__(self, layers: int = 2, iters: int = 30, shots: int = 10000, top: int = 64,
+                 init: str = "tqa", tqa_dt: float = 1.0, mu_ladder=(0.25, 1.0, 4.0),
+                 backend=None, seed: int = 0, compare_exact: bool = False):
+        self.layers, self.iters, self.shots, self.top = layers, iters, shots, top
+        self.init, self.tqa_dt, self.mu_ladder, self.seed = init, tqa_dt, tuple(mu_ladder), seed
+        self.compare_exact = compare_exact
+        if backend is None:
+            from divi.backends import MaestroSimulator
+            backend = MaestroSimulator(shots=shots)
+        self.backend = backend
+        self.cache: dict = {}
+        self.stats = dict(calls=0, cache_hits=0, qaoa_runs=0, mu_raised=0, proposals=0,
+                          no_feasible=0, qaoa_seconds=0.0, exact_checked=0, exact_hits=0,
+                          sample_hits=0, exact_gap=0.0)
+
+    def _key(self, L, S, days, G):
+        lo, hi, T = days[0], days[-1], len(L)
+        nb = [d for d in (lo - 1, hi + 1) if 0 <= d < T]
+        return (tuple(days), tuple(G.tolist()), L[days].tobytes(), S[days].tobytes(),
+                L[nb][:, G].tobytes(), S[nb][:, G].tobytes())
+
+    def _qaoa(self, bqm) -> np.ndarray:
+        """Top-``self.top`` bitstrings (K, nq) of QAOA on ``bqm``."""
+        from divi.qprog.algorithms import QAOA
+        from divi.qprog.optimizers import ScipyMethod, ScipyOptimizer
+        from divi.qprog.problems import BinaryOptimizationProblem
+
+        # QAOA needs O(1) energies: rescale (argmin unchanged)
+        scale = max(np.abs(list(bqm.linear.values())).max(),
+                    np.abs(list(bqm.quadratic.values()) or [0.0]).max())
+        bqm_n = bqm.copy()
+        bqm_n.scale(1.0 / scale)
+        q = QAOA(BinaryOptimizationProblem(bqm_n), n_layers=self.layers,
+                 optimizer=ScipyOptimizer(method=ScipyMethod.COBYLA),
+                 max_iterations=self.iters, backend=self.backend, seed=self.seed)
+        t0 = time.time()
+        if self.init == "tqa":
+            q.run(initial_params=tqa_params(self.layers, self.tqa_dt).reshape(q.get_expected_param_shape()))
+        else:  # Divi's default: uniform random angles
+            q.run()
+        self.stats["qaoa_seconds"] += time.time() - t0
+        self.stats["qaoa_runs"] += 1
+        tops = q.get_top_solutions(n=self.top)
+        # Divi orders bitstring characters like bqm_n.variables (0..nq-1 here)
+        order = list(bqm_n.variables)
+        bits = np.array([[int(ch) for ch in s.bitstring] for s in tops], dtype=np.int8)
+        out = np.zeros_like(bits)
+        out[:, order] = bits
+        return out
+
+    def __call__(self, ev: BlockEvaluator, L, S, days, G: np.ndarray) -> BlockResult:
+        assert ev.model.ub == 3, "signed 3-bit encoding needs ub = 3"
+        days = [days] if np.isscalar(days) else list(days)
+        G = np.asarray(G)
+        self.stats["calls"] += 1
+        key = self._key(L, S, days, G)
+        if key in self.cache:
+            self.stats["cache_hits"] += 1
+            return BlockResult(self.cache[key].copy())
+        cur = (L[days[0], G] - S[days[0], G]).astype(np.int64)
+        cur_cost = float(ev.costs(L, S, days, G, cur[None])[0][0])
+        best_V, best_c = cur, cur_cost
+        unit = None
+        any_feasible = False
+        sample_best = np.inf  # best feasible QAOA sample, ignoring the current holding
+        for k, step in enumerate((0.0,) + self.mu_ladder):
+            if k == 1:
+                # per-unit cost scale of the block: mean |cost change| of one unit on one asset
+                g = len(G)
+                V1 = np.concatenate([np.eye(g, dtype=np.int64), -np.eye(g, dtype=np.int64)])
+                c1, _ = ev.costs(L, S, days, G, V1)
+                c0, _ = ev.costs(L, S, days, G, np.zeros((1, g), np.int64))
+                unit = float(np.mean(np.abs(c1 - c0[0]))) or 1.0
+                self.stats["mu_raised"] += 1
+            mu = step * (unit or 0.0)
+            bqm, W, C, _ = block_qubo(ev, L, S, days, G, mu)
+            bits = self._qaoa(bqm)
+            Vq = decode(bits, W, C)
+            cq, okq = ev.costs(L, S, days, G, Vq)
+            if okq.any():
+                any_feasible = True
+                j = int(np.argmin(np.where(okq, cq, np.inf)))
+                sample_best = min(sample_best, float(cq[j]))
+                if cq[j] < best_c - 1e-9:
+                    best_V, best_c = Vq[j].copy(), float(cq[j])
+            # stop raising mu once the QUBO's own best sample obeys the rules
+            e = bqm.energies((bits, list(range(bits.shape[1]))))
+            if okq[int(np.argmin(e))]:
+                break
+        self.stats["no_feasible"] += int(not any_feasible)
+        self.stats["proposals"] += int(best_c < cur_cost - 1e-9)
+        if self.compare_exact:
+            Vall = _net_configs(len(G), ev.model.ub)
+            cost, ok = ev.costs(L, S, days, G, Vall)
+            ex = float(np.min(np.where(ok, cost, np.inf)))
+            self.stats["exact_checked"] += 1
+            self.stats["exact_hits"] += int(np.isclose(best_c, ex))
+            self.stats["sample_hits"] += int(np.isclose(sample_best, ex))
+            self.stats["exact_gap"] += best_c - ex
+        self.cache[key] = best_V
+        return BlockResult(best_V.copy())
+
+    def summary(self) -> dict:
+        st = dict(self.stats, layers=self.layers, iters=self.iters, shots=self.shots, top=self.top,
+                  init=self.init, tqa_dt=self.tqa_dt, mu_ladder=list(self.mu_ladder))
+        st["qaoa_seconds"] = round(st["qaoa_seconds"], 1)
+        return st
 
 
 def run(args):
