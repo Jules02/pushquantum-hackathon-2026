@@ -264,12 +264,14 @@ def clamp_and_iterate(
     verbose: bool = True,
     days_subset=None,
     sweep_offset: int = 0,
+    deadline: float | None = None,
 ) -> dict:
     """Re-solve every (window of days, group) block until ``patience`` sweeps improve nothing.
 
     A proposal is accepted only if the official score (``PortfolioModel.score_arrays``)
     improves and the portfolio stays feasible. ``days_subset`` restricts the blocks to
     windows inside those days; ``sweep_offset`` shifts which groupings are used.
+    ``deadline`` (a ``time.time()`` value) stops between blocks once passed.
     """
     ev = BlockEvaluator(model)
     T, n = model.n_periods, len(model.symbols)
@@ -287,6 +289,8 @@ def clamp_and_iterate(
         before = best
         for days in schedule:
             for G in groups(sweep + sweep_offset):
+                if deadline is not None and time.time() > deadline:
+                    break
                 V = solver(ev, L, S, days, G).V
                 blocks += 1
                 L2, S2 = L.copy(), S.copy()
@@ -299,6 +303,8 @@ def clamp_and_iterate(
                     L, S, best = L2, S2, new.objective
                     accepted += 1
         history.append(best)
+        if deadline is not None and time.time() > deadline:
+            break
         if verbose:
             print(f"  sweep {sweep + 1}: {best}", flush=True)
         stale = stale + 1 if best >= before else 0
@@ -350,7 +356,9 @@ def iterated_search(
     ev = BlockEvaluator(model)
     T = model.n_periods
     t0 = time.time()
-    res = clamp_and_iterate(model, groups, solver, L=L, S=S, max_sweeps=200, patience=3, verbose=False)
+    # The deadline matters for slow block solvers (QAOA); exact sweeps finish far sooner.
+    res = clamp_and_iterate(model, groups, solver, L=L, S=S, max_sweeps=200, patience=3, verbose=False,
+                            deadline=t0 + time_limit)
     best_L, best_S, best = res["L"], res["S"], res["score"]
     start_score = best
     trace = [(round(time.time() - t0, 1), best)]
@@ -363,12 +371,14 @@ def iterated_search(
         near = sorted({d for t in kdays for d in (t - 1, t, t + 1) if 0 <= d < T})
         offset += 1
         r = clamp_and_iterate(model, groups, solver, L=L2, S=S2, max_sweeps=50, patience=1,
-                              verbose=False, days_subset=near, sweep_offset=offset)
+                              verbose=False, days_subset=near, sweep_offset=offset,
+                              deadline=t0 + time_limit)
         kicks += 1
         if r["score"] < best:
             offset += 1
             r = clamp_and_iterate(model, groups, solver, L=r["L"], S=r["S"], max_sweeps=50,
-                                  patience=1, verbose=False, sweep_offset=offset)
+                                  patience=1, verbose=False, sweep_offset=offset,
+                                  deadline=t0 + time_limit)
             best_L, best_S, best = r["L"], r["S"], r["score"]
             improvements += 1
             trace.append((round(time.time() - t0, 1), best))
@@ -525,6 +535,7 @@ def main() -> None:
     ap.add_argument("--no-sa", action="store_true", help="start from an empty portfolio")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--solutions", default="solutions")
+    add_solver_args(ap)
     args = ap.parse_args()
     model, bkv = _load(args.instance, args.budget, args.lam)
     print(f"{args.instance}, B={args.budget}, λ={args.lam}, {len(model.symbols)} assets, "
@@ -556,12 +567,39 @@ def main() -> None:
                   + f", {len(r['history']) - 1} sweeps, {r['blocks']} blocks, {r['seconds']}s", flush=True)
         rows.append(dict(method=method, **r))
     if args.command == "solve":
-        Path(args.out).mkdir(exist_ok=True)
+        Path(args.out).mkdir(parents=True, exist_ok=True)
         path = Path(args.out) / (f"groups_{args.instance}_B{args.budget}_lam{args.lam}_g{args.size}"
                                 f"_w{'-'.join(map(str, args.windows))}.json")
         path.write_text(json.dumps(dict(instance=args.instance, budget=args.budget, lam=args.lam,
                                         bkv=bkv, size=args.size, windows=args.windows, runs=rows), indent=2, default=float))
         print(f"\nSaved {path}")
+
+
+def add_solver_args(ap: argparse.ArgumentParser) -> None:
+    """Block-solver options shared by ``asset_groups.py pipeline`` and ``auto_worker.py``."""
+    ap.add_argument("--solver", choices=["exact", "qaoa"], default="exact",
+                    help="block solver: enumeration, or QAOA on the signed 3-bit QUBO (qaoa_signed_blocks)")
+    ap.add_argument("--qaoa-layers", type=int, default=2)
+    ap.add_argument("--qaoa-iters", type=int, default=30, help="COBYLA iterations per block")
+    ap.add_argument("--qaoa-shots", type=int, default=10000)
+    ap.add_argument("--qaoa-top", type=int, default=64, help="most probable samples decoded per block")
+    ap.add_argument("--qaoa-init", choices=["tqa", "random"], default="tqa",
+                    help="starting angles: TQA ramp (default) or Divi's uniform random")
+    ap.add_argument("--tqa-dt", type=float, default=1.0, help="TQA time step per layer")
+    ap.add_argument("--qaoa-compare-exact", action="store_true",
+                    help="diagnostic: also enumerate each block to count how often QAOA hits its optimum")
+
+
+def make_solver(args):
+    """``(solver, describe)`` for ``args.solver``; ``describe()`` -> JSON-able stats."""
+    if getattr(args, "solver", "exact") == "exact":
+        return solve_block_exact, lambda: dict(name="exact")
+    from qaoa_signed_blocks import QAOABlockSolver  # imports this module: keep it lazy
+
+    s = QAOABlockSolver(layers=args.qaoa_layers, iters=args.qaoa_iters, shots=args.qaoa_shots,
+                        top=args.qaoa_top, init=args.qaoa_init, tqa_dt=args.tqa_dt,
+                        seed=args.seed, compare_exact=args.qaoa_compare_exact)
+    return s, lambda: dict(name="qaoa", **s.summary())
 
 
 def run_pipeline(model: qt.PortfolioModel, bkv, args) -> dict:
@@ -581,23 +619,29 @@ def run_pipeline(model: qt.PortfolioModel, bkv, args) -> dict:
         rec["start"], rec["sa"] = info["score"], info
         print(f"  start (SA + fast repair): {fmt(info['score'])}", flush=True)
     groups = grouping_fn(model, args.size, args.methods[0])
+    solver, describe = make_solver(args)
     r = iterated_search(model, groups, L=L, S=S, time_limit=args.time, kick_blocks=args.kick_blocks,
-                        kick_size=args.size, seed=args.seed, verbose=False)
+                        kick_size=args.size, solver=solver, seed=args.seed, verbose=False)
+    rec["solver"] = describe()
     sc = model.score_arrays(r["L"], r["S"])
     assert sc.feasible and sc.objective == r["score"]
     print(f"  blocks: {fmt(r['start_score'])} -> iterated search: {fmt(r['score'])} "
           f"({r['kicks']} kicks, {r['improvements']} improvements); total {time.time() - t0:.0f}s", flush=True)
     rec.update(blocks=r["start_score"], score=r["score"], gap=gap(r["score"]), kicks=r["kicks"],
                improvements=r["improvements"], trace=r["trace"], seconds=round(time.time() - t0, 1))
-    Path(args.solutions).mkdir(exist_ok=True)
+    if rec["solver"]["name"] != "exact":
+        print(f"  solver: {rec['solver']}", flush=True)
+    Path(args.solutions).mkdir(parents=True, exist_ok=True)
     lam_tag = args.lam
     sol = Path(args.solutions) / f"{model.instance.name}_b{model.budget:03d}_l{lam_tag}.sol"
     model.write_solution(sol, model.to_positions(r["L"], r["S"]),
-                         comment=f"asset groups of {args.size} ({args.methods[0]}) + iterated search, "
+                         comment=f"asset groups of {args.size} ({args.methods[0]}), {rec['solver']['name']} block solver"
+                                 f" + iterated search, "
                                  f"{'empty' if args.no_sa else 'SA'} start")
     rec["solution_file"] = str(sol)
-    Path(args.out).mkdir(exist_ok=True)
-    out = Path(args.out) / f"pipeline_{model.instance.name}_B{model.budget}_lam{lam_tag}_seed{args.seed}.json"
+    Path(args.out).mkdir(parents=True, exist_ok=True)
+    tag = "" if rec["solver"]["name"] == "exact" else f"_{rec['solver']['name']}"
+    out = Path(args.out) / f"pipeline_{model.instance.name}_B{model.budget}_lam{lam_tag}_seed{args.seed}{tag}.json"
     out.write_text(json.dumps(rec, indent=2, default=float))
     print(f"  wrote {sol} and {out}")
     return rec
