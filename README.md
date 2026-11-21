@@ -48,6 +48,32 @@ Divi 0.16.2 needs Python 3.11 or newer. The version is pinned because names can 
 minor versions. Put your key in a file called `.env` next to the notebooks, containing
 `QORO_API_KEY="your_api_key_here"`. The repository's `.gitignore` keeps `.env` out of commits.
 
+### Reproducible environment (`requirements.txt`)
+
+`requirements.txt` pins every package of a tested environment (Python 3.12, Divi 0.16.2), produced
+with `pip freeze`.
+
+With conda:
+
+```bash
+conda create -n Munich_hackathon python=3.12 -y
+conda activate Munich_hackathon
+pip install -r requirements.txt
+python -m ipykernel install --user --name Munich_hackathon --display-name "Python (Munich_hackathon)"
+```
+
+With plain pip and a virtual environment:
+
+```bash
+python -m venv Munich_hackathon
+# Windows: Munich_hackathon\Scripts\activate    macOS/Linux: source Munich_hackathon/bin/activate
+pip install -r requirements.txt
+python -m ipykernel install --user --name Munich_hackathon --display-name "Python (Munich_hackathon)"
+```
+
+Then pick the **Python (Munich_hackathon)** kernel in Jupyter or VS Code. To refresh the file after
+installing something new: `pip freeze > requirements.txt`.
+
 Optional: Maestro, Qoro's simulator, as a drop-in for code you write directly in Qiskit
 (`pip install qiskit-maestro`) or PennyLane (`pip install pennylane-maestro`).
 
