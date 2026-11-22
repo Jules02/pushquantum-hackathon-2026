@@ -2253,6 +2253,14 @@ def _compute_gap(
     return round((float(score) - float(best_known)) / abs(float(best_known)), 6)
 
 
+def _format_gap(
+    score: int | float | None,
+    best_known: int | float | None,
+) -> str:
+    gap = _compute_gap(score, best_known)
+    return "N/A" if gap is None else f"{gap:+.2%}"
+
+
 def execute_task_stack(
     *,
     script_path: Path,
@@ -2390,7 +2398,8 @@ def execute_task_stack(
                 print(
                     f"[DONE]   {job.task.display_name} | exit={rc} | {duration:.2f}s | "
                     f"sol={exec_result.solution_rel_path} | score={checked_obj} "
-                    f"(feasible={feasible}) | best_known={best_known}"
+                    f"(feasible={feasible}) | best_known={best_known} | "
+                    f"gap={_format_gap(checked_obj, best_known)}"
                 )
 
             active = still_active
@@ -2426,7 +2435,9 @@ def execute_task_stack(
             score_display = best_obj if best_obj is not None else best_r.reported_score
             print(
                 f"[BEST]   {inst_name} | best_solver_seed={best_r.task.solver_seed} | "
-                f"score={score_display} | sol={best_r.best_solution_file}"
+                f"score={score_display} | sol={best_r.best_solution_file} | "
+                f"best_known={best_r.best_known_score} | "
+                f"gap={_format_gap(score_display, best_r.best_known_score)}"
             )
 
     return ordered
