@@ -334,6 +334,27 @@ def _angles(gs, bs, layers):
     return [np.array([g, b] * layers, float) for g in gs for b in bs]
 
 
+def _parse_angle_sets(spec):
+    """'0.25,-0.4; 0.25,-0.4,0.1,-0.2; tqa:0.6:2' -> list of [γ0, β0, γ1, β1, ...] vectors.
+
+    ``tqa:dt:p`` is the TQA linear ramp (``qaoa_signed_blocks.tqa_params``): γ ramps up,
+    β (negative, as the warm-start mixer needs) ramps down, total time p*dt.
+    """
+    from qaoa_signed_blocks import tqa_params  # noqa: PLC0415
+
+    out = []
+    for item in spec.split(";"):
+        item = item.strip()
+        if item.startswith("tqa:"):
+            _, dt, p = item.split(":")
+            out.append(tqa_params(int(p), float(dt)))
+        elif item:
+            v = np.array([float(x) for x in item.split(",")], float)
+            assert len(v) % 2 == 0, item
+            out.append(v)
+    return out
+
+
 def cmd_sweep(a):
     """Whole days (or sub-blocks): QAOA at each (γ, β) vs the γ=0 product-state baseline."""
     model, bkv, ev, L, S = _setup(a)
@@ -350,7 +371,12 @@ def cmd_sweep(a):
         blk = build_block(ev, L, S, t, a.mu_step, a.eps, G)
         blk["full_cur"] = (L[t] - S[t]).astype(np.int64)
         blocks.append(blk)
-    angles = _angles([float(x) for x in a.gammas.split(",")], [float(x) for x in a.betas.split(",")], a.layers)
+    if a.angle_sets:
+        angles = _parse_angle_sets(a.angle_sets)
+        if len({len(x) for x in angles}) > 1 and not a.swapnet:
+            raise SystemExit("mixed depths need --swapnet")
+    else:
+        angles = _angles([float(x) for x in a.gammas.split(",")], [float(x) for x in a.betas.split(",")], a.layers)
     progs, prog_blocks = [], []
     for blk in blocks:
         for ang in angles:
@@ -373,11 +399,12 @@ def cmd_sweep(a):
         q = score_samples(blk, Fs[blk["t"]], bits, probs)
         base = score_samples(blk, Fs[blk["t"]], classical_baseline(blk, a.shots, rng))
         row = dict(day=blk["t"], qubits=blk["nq"], gamma=float(ang[0]), beta=float(ang[1]),
+                   angles=[float(x) for x in ang], p=len(ang) // 2,
                    qaoa={k: v for k, v in q.items() if k != "best_v"},
                    base={k: v for k, v in base.items() if k != "best_v"},
                    qaoa_best_v=None if q["best_v"] is None else q["best_v"].tolist())
         rows.append(row)
-        print(f"day {blk['t']:2d} γ {ang[0]:.2f} β {ang[1]:.2f}: "
+        print(f"day {blk['t']:2d} p={len(ang) // 2} {np.round(ang, 3).tolist()}: "
               f"feasible {q['p_feasible']:.3f}/{base['p_feasible']:.3f}  improve {q['p_improve']:.4f}/"
               f"{base['p_improve']:.4f}  mean Δ {q['mean_cost_feasible'] if q['mean_cost_feasible'] is None else round(q['mean_cost_feasible'],1)}"
               f"/{base['mean_cost_feasible'] if base['mean_cost_feasible'] is None else round(base['mean_cost_feasible'],1)}  "
@@ -423,18 +450,23 @@ def cmd_loop(a):
     tracks = {"qaoa": [L0.copy(), S0.copy()], "base": [L0.copy(), S0.copy()]}
     rng = np.random.default_rng(a.seed)
     days = list(range(T)) if a.days == "all" else [int(d) for d in a.days.split(",")]
-    ang = np.array([a.gamma, a.beta] * a.layers, float)
+    if a.angle_sets:
+        (ang,) = _parse_angle_sets(a.angle_sets)
+        a.layers = len(ang) // 2
+    else:
+        ang = np.array([a.gamma, a.beta] * a.layers, float)
     backend = make_backend(a.cluster, a.shots, a.mps_chi, f"warm_loop_{3 * n}q")
     service = QoroService() if a.cluster != "local" else None
     bal0 = float(service.get_credit_balance()["balance"]) if service else None
     start = model.score_arrays(L0, S0).objective
     hist = [dict(round=0, qaoa=start, base=start)]
     print(f"{a.instance} λ{a.lam} start {start} (bkv {bkv}); {len(days)} days x {3 * n} qubits per round, "
-          f"eps {a.eps}, γ {a.gamma}, β {a.beta}, p={a.layers}, shots {a.shots}, chi {a.mps_chi}, {a.cluster}",
+          f"eps {a.eps}, angles {np.round(ang, 3).tolist()}, p={a.layers}, shots {a.shots}, chi {a.mps_chi}, {a.cluster}",
           flush=True)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    tag = f"{a.instance}_l{a.lam}_{'empty' if a.sol == 'empty' else 'warm'}_g{a.gamma}_b{a.beta}_e{a.eps}_{a.cluster}"
+    sched = a.angle_sets.replace(":", "").replace(";", "") if a.angle_sets else f"g{a.gamma}_b{a.beta}"
+    tag = f"{a.instance}_l{a.lam}_{'empty' if a.sol == 'empty' else 'warm'}_{sched}_e{a.eps}_{a.cluster}"
     for r in range(1, a.rounds + 1):
         L, S = tracks["qaoa"]
         blocks = [build_block(ev, L, S, t, a.mu_step, a.eps) for t in days]
@@ -482,6 +514,7 @@ def main():
     lp.add_argument("--gamma", type=float, default=0.5)
     lp.add_argument("--beta", type=float, default=-0.4)
     lp.add_argument("--layers", type=int, default=1)
+    lp.add_argument("--angle-sets", default="", help="one schedule, e.g. tqa:0.5:3; overrides --gamma/--beta/--layers")
     lp.add_argument("--shots", type=int, default=2000)
     lp.add_argument("--mps-chi", type=int, default=16)
     lp.add_argument("--cluster", default="local")
@@ -501,6 +534,8 @@ def main():
     s.add_argument("--gammas", default="0,0.3")
     s.add_argument("--betas", default="0.3")
     s.add_argument("--layers", type=int, default=1)
+    s.add_argument("--angle-sets", default="",
+                   help="';'-separated angle vectors γ0,β0[,γ1,β1...] or tqa:dt:p; overrides --gammas/--betas/--layers")
     s.add_argument("--shots", type=int, default=2000)
     s.add_argument("--mps-chi", type=int, default=0, help="MPS bond dimension (0 = statevector)")
     s.add_argument("--cluster", default="local")
