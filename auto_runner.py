@@ -31,6 +31,10 @@ Expected outputs from the target script:
      a line prefixed with ``AUTORUNNER_RESULT:``, or the final JSON object in
      stdout) containing ``score`` (numeric) and/or ``extra`` (arbitrary JSON
      object). Plain ``score`` + JSON output is also accepted.
+
+Pass solver-specific options after ``--``. ``auto_worker.py``, ``day_swap.py``
+and ``day_swap_parallel.py`` accept a warm-start ``--init`` with a .sol file
+or a directory containing ``<full_instance_name>.sol`` for each task.
 """
 
 from __future__ import annotations
@@ -70,6 +74,8 @@ INSTANCES_DIR = REPO_ROOT / "instances"
 QOBLIB_DATA_INSTANCES_DIR = REPO_ROOT / "qoblib_data" / "06-portfolio" / "instances"
 SUBMISSIONS_DIR = REPO_ROOT / "submissions"
 SOLUTION_CHECKER = REPO_ROOT / "solution_checker.py"
+DAY_SWAP_SCRIPTS = {"day_swap.py", "day_swap_parallel.py"}
+WARM_START_SCRIPTS = DAY_SWAP_SCRIPTS | {"auto_worker.py"}
 AUTODATA_DIR = REPO_ROOT / "AutoData"
 
 # Hardcoded risk-aversion lambda grid (indexed 0..7)
@@ -701,8 +707,29 @@ def build_task_stack(
     seed_arg: str,
     risk_index: int,
     solver_seeds: list[int] | None = None,
+    instance_specs: list[str] | None = None,
 ) -> tuple[str, list[InstanceTask], dict[str, Any]]:
     """Build the ordered task stack according to CLI selection rules."""
+    if instance_specs:
+        if manual_tokens is not None or test_arg is not None:
+            raise ValueError("--instance cannot be combined with --manual or --tests")
+        lam, lam_tag = risk_from_index(risk_index)
+        seed = normalize_seed(seed_arg)
+        tasks_by_name = {}
+        for spec in instance_specs:
+            task = parse_instance_spec(
+                spec, default_seed=seed, default_lam=lam, default_lam_tag=lam_tag,
+            )
+            tasks_by_name.setdefault(task.full_name, task)
+        return "instances", _expand_tasks_with_solver_seeds(list(tasks_by_name.values()), solver_seeds), {
+            "mode": "instances",
+            "instance_specs": instance_specs,
+            "seed_used": seed,
+            "risk_index_used": risk_index,
+            "risk_lambda_used": lam,
+            "solver_seeds": solver_seeds,
+        }
+
     if manual_tokens is not None:
         # Manual selection overwrites tests, seed, and risk parameters.
         indices = parse_manual_indices(manual_tokens, len(csv_rows))
@@ -728,7 +755,7 @@ def build_task_stack(
         return "manual", tasks, meta
 
     if test_arg is None:
-        raise ValueError("Specify either --tests <name|index> or --manual <indices...>.")
+        raise ValueError("Specify --tests <name|index>, --manual <indices...>, or --instance <spec>.")
 
     suite_name = resolve_test_suite_name(test_arg)
     lam, lam_tag = risk_from_index(risk_index)
@@ -1602,6 +1629,7 @@ def find_solution_file(run_dir: Path, task: InstanceTask, existing_before: set[P
 
     preferred_names = [
         f"{task.full_name}.sol",
+        f"{task.full_name}_day_swap/{task.full_name}.sol",
         f"{task.csv_instance_key}_l{task.lam_tag}.sol",
         f"{task.base_name}_b{task.budget:03d}_l{lam_sci}.sol",
         f"{task.csv_instance_key}_l{lam_sci}.sol",
@@ -1618,7 +1646,8 @@ def find_solution_file(run_dir: Path, task: InstanceTask, existing_before: set[P
     candidates = [
         p
         for p in run_dir.glob("*.sol")
-        if p not in existing_before and (base_no_prefix in p.name or task.base_name in p.name)
+        if p not in existing_before and not p.name.endswith(".ckpt.sol")
+        and (base_no_prefix in p.name or task.base_name in p.name)
     ]
     if candidates:
         candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -1779,6 +1808,34 @@ def get_task_work_dir(run_dir: Path, task: InstanceTask, multi_seed: bool) -> Pa
     return run_dir
 
 
+def resolve_warm_start_args(
+    script_path: Path, task: InstanceTask, extra_args: list[str] | None,
+) -> list[str]:
+    """Resolve warm starts before workers change their working directory."""
+    out = list(extra_args or [])
+    if script_path.name not in WARM_START_SCRIPTS:
+        return out
+    for i, arg in enumerate(out):
+        if arg == "--init":
+            if i + 1 == len(out) or out[i + 1].startswith("--"):
+                raise ValueError("--init requires a .sol file or directory")
+            index, value = i + 1, out[i + 1]
+        elif arg.startswith("--init="):
+            index, value = i, arg.removeprefix("--init=")
+        else:
+            continue
+        path = Path(value).expanduser().resolve()
+        if path.is_dir():
+            path /= f"{task.full_name}.sol"
+        if not path.is_file():
+            raise FileNotFoundError(f"Warm-start solution for {task.full_name} not found: {path}")
+        out[index] = f"--init={path}" if index == i else str(path)
+        return out
+    if script_path.name in DAY_SWAP_SCRIPTS:
+        raise ValueError(f"{script_path.name} requires --init after the runner's -- separator")
+    return out
+
+
 def build_target_command(
     script_path: Path,
     task: InstanceTask,
@@ -1790,6 +1847,7 @@ def build_target_command(
     rel_instance_dir = os.path.relpath(task.instance_dir, task_cwd)
     cloud_flag = "false" if local else "true"
 
+    solver_args = resolve_warm_start_args(script_path, task, extra_args)
     cmd = [
         sys.executable,
         str(script_path.resolve()),
@@ -1810,8 +1868,23 @@ def build_target_command(
     ]
     if task.solver_seed is not None:
         cmd.extend(["--solver-seed", str(task.solver_seed)])
-    if extra_args:
-        cmd.extend(extra_args)
+    if script_path.name in DAY_SWAP_SCRIPTS:
+        # The standalone day-swap CLIs take a base name and use the referee cache.
+        cmd = [
+            sys.executable, str(script_path.resolve()), "--instance", task.base_name,
+            "--budget", str(task.budget), "--lam", task.lam_tag,
+        ]
+        if task.solver_seed is not None:
+            cmd.extend(["--seed", str(task.solver_seed)])
+        # Keep the detected final solution in the job directory and isolate
+        # the parallel workers' intermediate files by instance.
+        cmd.extend(solver_args)
+        if script_path.name == "day_swap_parallel.py":
+            cmd.extend(["--out", f"{task.full_name}_day_swap"])
+        else:
+            cmd.extend(["--out", ".", "--canonical-sol"])
+    else:
+        cmd.extend(solver_args)
 
     env = os.environ.copy()
     existing_py_path = env.get("PYTHONPATH", "")
@@ -2047,6 +2120,8 @@ def start_task_job(
     extra_args: list[str] | None = None,
 ) -> ActiveJob:
     """Start one instance task either silently or in a visible OS terminal."""
+    if script_path.name in DAY_SWAP_SCRIPTS:
+        ensure_qoblib_data_cache(task)
     cmd, env = build_target_command(
         script_path, task, task_cwd, local, extra_args=extra_args
     )
@@ -2454,6 +2529,7 @@ def build_final_report(
     resource_report: dict[str, Any],
     results: list[TaskExecutionResult],
     throttle_events: list[dict[str, Any]] | None = None,
+    solver_args: list[str] | None = None,
 ) -> dict[str, Any]:
     """Assemble the final JSON structure specified in ``AutoRunner.md``."""
     grouped = _group_results_by_instance(results)
@@ -2558,6 +2634,7 @@ def build_final_report(
         "instances": instance_names,
         "run_config": {
             "script": str(script_path.resolve()),
+            "solver_args": list(solver_args or []),
             "run_dir": str(run_dir.relative_to(REPO_ROOT)),
             "local": local,
             "silent": silent,
@@ -2587,6 +2664,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "write structured JSON reports under AutoData/."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Pass solver options after -- (for example: -- --init handin --day-blocks --day-tscale 0.5).",
     )
 
     parser.add_argument(
@@ -2610,6 +2688,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "-t",
         default=None,
         help=f"Predefined test suite by name or index ({tests_help}).",
+    )
+    parser.add_argument(
+        "--instance",
+        action="append",
+        metavar="SPEC",
+        help="Run an explicit instance, e.g. po_a400_t15_orig_b100_l1e-3. Repeat for multiple instances.",
     )
     parser.add_argument(
         "--silent",
@@ -2809,7 +2893,15 @@ def main(argv: list[str] | None = None) -> int:
             seed_arg=args.seed,
             risk_index=args.risk,
             solver_seeds=solver_seeds,
+            instance_specs=args.instance,
         )
+        for task in tasks:
+            resolve_warm_start_args(script_path, task, script_extra_args)
+        if script_path.name in DAY_SWAP_SCRIPTS and not local:
+            raise ValueError(f"{script_path.name} is a local-only solver")
+        if script_path.name == "day_swap_parallel.py" and args.max_workers is None:
+            # Each benchmark job launches its own pool of day shards.
+            args.max_workers = 1
     except (ValueError, FileNotFoundError) as exc:
         parser.error(str(exc))
 
@@ -2885,6 +2977,7 @@ def main(argv: list[str] | None = None) -> int:
         resource_report=resource_report,
         results=results,
         throttle_events=gpu_monitor.throttle_events if gpu_monitor is not None else None,
+        solver_args=script_extra_args,
     )
     json_path = get_unique_json_path(run_dir, test_name, finished_at)
     json_path.write_text(

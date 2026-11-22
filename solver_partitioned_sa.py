@@ -21,12 +21,15 @@ import re
 import sys
 import time
 from typing import Protocol
+from fractions import Fraction
 
 import dimod
 import numpy as np
 
 import qoblib_tools as qt
-from asset_groups import BlockEvaluator, BlockResult, clamp_and_iterate, grouping_fn
+import day_swap
+from asset_groups import (BlockEvaluator, BlockResult, clamp_and_iterate,
+                          grouping_fn, iterated_search, solve_block_exact)
 from auto_worker import load_instance_dir
 from big_blocks import block_form, solve_sa
 from qaoa_signed_blocks import CODES, block_qubo, decode
@@ -129,62 +132,73 @@ def encode_holding(holding: np.ndarray, weights: np.ndarray, offsets: np.ndarray
 
 
 class PartitionSASolver:
-    """Adapter from a sequence of BQM sampling stages to asset_groups.BlockSolver."""
+    """Adapter from BQM sampling stages to asset_groups.BlockSolver (with mu ladder)."""
 
-    def __init__(
-        self,
-        stages: tuple[BlockStage, ...],
-        seed: int,
-        integer_polish: tuple[int, int] | None = None,
-    ) -> None:
+    def __init__(self, stages, seed, integer_polish=None, mu_ladder=(0.25, 1.0, 4.0)):
         self.stages = stages
         self.rng = np.random.default_rng(seed)
         self.integer_polish = integer_polish
+        self.mu_ladder = tuple(mu_ladder)
         self.stage_calls = 0
         self.max_qubo_vars = 0
+        self.mu_raised = 0
 
-    def __call__(self, ev: BlockEvaluator, L, S, days, G: np.ndarray) -> BlockResult:
-        # This solver uses one day per block, so the current net holding is a
-        # feasible incumbent for every block. Multi-day blocks need a separate
-        # feasible initializer if their current holdings differ between days.
+    @staticmethod
+    def _unit_scale(ev, L, S, days, G):
+        g = len(G)
+        V1 = np.concatenate([np.eye(g, dtype=np.int64), -np.eye(g, dtype=np.int64)])
+        c1, _ = ev.costs(L, S, days, G, V1)
+        c0, _ = ev.costs(L, S, days, G, np.zeros((1, g), np.int64))
+        return float(np.mean(np.abs(c1 - c0[0]))) or 1.0
+
+    def __call__(self, ev, L, S, days, G):
         if len(days) != 1 or ev.model.ub != 3:
             raise ValueError("Signed SA blocks require one day and position bounds [-3, 3]")
         current = L[days[0], G] - S[days[0], G]
         best = current
         best_cost = ev.costs(L, S, days, G, current[None])[0][0]
-        bqm, weights, offsets, _ = block_qubo(ev, L, S, days, G, mu=0.0)
-        self.max_qubo_vars = max(self.max_qubo_vars, bqm.num_variables)
-        labels = list(range(bqm.num_variables))
-        best_bits = encode_holding(current, weights, offsets)
-        starts = best_bits[None]
+        unit = None
 
-        for stage in self.stages:
-            bits = np.asarray(stage(bqm, starts, self.rng))
-            self.stage_calls += 1
-            if bits.ndim != 2 or bits.shape[1] != bqm.num_variables or not np.all(
-                (bits == 0) | (bits == 1)
-            ):
-                raise ValueError("Block stages must return a (reads, n_bits) binary array")
-            if not len(bits):
-                continue
-            bits = bits.astype(np.int8, copy=False)
-            holdings = decode(bits, weights, offsets)
-            costs, feasible = ev.costs(L, S, days, G, holdings)
-            if feasible.any():
-                j = int(np.argmin(np.where(feasible, costs, np.inf)))
-                if costs[j] < best_cost:
-                    best, best_cost, best_bits = holdings[j], costs[j], bits[j]
-            # Keep the feasible incumbent even when the lowest QUBO-energy
-            # sample is infeasible. Let the next stage explore both basins.
-            energies = bqm.energies((bits, labels))
-            low_energy = bits[int(np.argmin(energies))]
-            starts = best_bits[None] if np.array_equal(best_bits, low_energy) else np.stack(
-                (best_bits, low_energy)
-            )
+        for k, step in enumerate((0.0,) + self.mu_ladder):
+            if k >= 1:
+                if unit is None:
+                    unit = self._unit_scale(ev, L, S, days, G)
+                self.mu_raised += 1
+            mu = step * (unit or 0.0)
+            bqm, weights, offsets, _ = block_qubo(ev, L, S, days, G, mu=mu)
+            self.max_qubo_vars = max(self.max_qubo_vars, bqm.num_variables)
+            labels = list(range(bqm.num_variables))
+            best_bits = encode_holding(best, weights, offsets)  # re-encode per rung
+            starts = best_bits[None]
+            low_feasible = False
+
+            for stage in self.stages:
+                bits = np.asarray(stage(bqm, starts, self.rng))
+                self.stage_calls += 1
+                if bits.ndim != 2 or bits.shape[1] != bqm.num_variables or not np.all(
+                    (bits == 0) | (bits == 1)
+                ):
+                    raise ValueError("Block stages must return a (reads, n_bits) binary array")
+                if not len(bits):
+                    continue
+                bits = bits.astype(np.int8, copy=False)
+                holdings = decode(bits, weights, offsets)
+                costs, feasible = ev.costs(L, S, days, G, holdings)
+                if feasible.any():
+                    j = int(np.argmin(np.where(feasible, costs, np.inf)))
+                    if costs[j] < best_cost - 1e-9:
+                        best, best_cost, best_bits = holdings[j], costs[j], bits[j]
+                energies = bqm.energies((bits, labels))
+                jl = int(np.argmin(energies))
+                low_feasible = bool(feasible[jl])      # lowest-QUBO-energy sample obeys rules
+                low_energy = bits[jl]
+                starts = best_bits[None] if np.array_equal(best_bits, low_energy) else np.stack(
+                    (best_bits, low_energy)
+                )
+            if low_feasible:
+                break                                   # budget price is high enough
 
         if self.integer_polish is not None:
-            # Existing budget-preserving one-/two-asset moves can polish a
-            # feasible binary-SA sample even when most other samples violate caps.
             chains, sweeps = self.integer_polish
             form = block_form(ev, L, S, days, G)
             best = solve_sa(form, best, self.rng, chains=chains, sweeps=sweeps)
@@ -231,11 +245,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--patience", type=positive_int, default=2, help="Stop after this many non-improving passes")
     p.add_argument("--sa-reads", type=positive_int, default=24)
     p.add_argument("--sa-sweeps", type=positive_int, default=120, help="SA sweeps per read per stage")
-    p.add_argument("--sa-backend", choices=("auto", "numpy", "dwave"), default="auto",
+    p.add_argument("--sa-backend", choices=("auto", "numpy", "dwave"), default="dwave",
                    help="Auto prefers dwave-samplers and falls back to NumPy (default: auto)")
     p.add_argument("--reheats", type=int, default=1, help="Extra warm-started stages per block; 0 disables reheats")
     p.add_argument("--reheat-temperature-scale", type=float, default=2.0, help="Initial temperature multiplier for reheats")
     p.add_argument("--integer-polish", action="store_true", help="Finish each block with constrained integer SA")
+    p.add_argument("--block-solver", choices=("sa", "exact"), default="sa",
+               help="exact enumerates all 7**g holdings; use for --group-size <= 5")
+    p.add_argument("--mu-ladder", type=float, nargs="*", default=[0.25, 1.0, 4.0],
+                   help="unit-price multipliers tried after mu=0; empty disables")
+    p.add_argument("--polish-chains", type=positive_int, default=8)
+    p.add_argument("--polish-sweeps", type=positive_int, default=200)
+    p.add_argument("--init", default=None, help="warm-start .sol file")
+    p.add_argument("--time", type=float, default=0.0, help="iterated_search seconds (0 = off)")
+    p.add_argument("--kick-blocks", type=positive_int, default=3)
+    p.add_argument("--kick-size", type=positive_int, default=5)
+    p.add_argument("--day-swap", type=float, default=0.0,
+               help="seconds of day_swap.run after block passes (0 = off)")
     return p
 
 
@@ -257,6 +283,15 @@ def load_instance(instance: str, instance_dir: Path | None) -> qt.PortfolioInsta
             return load_instance_dir(directory, base)
     return qt.load_portfolio_instance(base)
 
+def resolve_init_path(name: str) -> Path:
+    """Accept a path as given, or a bare filename found in handin/ (next to this script)."""
+    p = Path(name)
+    for cand in (p, Path.cwd() / "handin" / p.name, SCRIPT_DIR / "handin" / p.name):
+        if cand.is_file():
+            return cand
+    raise FileNotFoundError(
+        f"--init {name!r} not found (looked in ., ./handin and {SCRIPT_DIR / 'handin'})"
+    )
 
 def main(argv: list[str] | None = None) -> int:
     p = build_arg_parser()
@@ -289,6 +324,13 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(f"Day/period count mismatch for {inst.name}: expected {args.days}, got {inst.n_periods}")
     if args.cloud:
         print("--cloud was requested; partitioned SA still runs locally on CPU.", flush=True)
+    if args.block_solver == "exact":
+        if args.group_size > 5:
+            p.error("--block-solver exact is only sensible for --group-size <= 5")
+        make_solver = lambda seed: solve_block_exact
+    else:
+        polish = (args.polish_chains, args.polish_sweeps) if args.integer_polish else None
+        make_solver = lambda seed: PartitionSASolver(stages, seed, polish, tuple(args.mu_ladder))
 
     model = qt.PortfolioModel(inst, budget=args.budget, lam=args.lam)
     if not model.score({}).feasible:
@@ -298,30 +340,58 @@ def main(argv: list[str] | None = None) -> int:
                     restart_all_reads=True, backend=backend),
     ) * args.reheats
     groups = grouping_fn(model, args.group_size, args.group_method)
+    L0 = S0 = None
+    if args.init:
+        init_path = resolve_init_path(args.init)
+        header, init_pos = qt.read_portfolio_solution(init_path)
+        try:
+            hdr_lam = Fraction(header["lambda"])
+        except (KeyError, ValueError):
+            hdr_lam = None
+        if (header.get("instance") not in (None, inst.name)
+                or int(header.get("budget", args.budget)) != args.budget
+                or (hdr_lam is not None and hdr_lam != model.lam)):
+            p.error(f"--init header (instance={header.get('instance')}, B={header.get('budget')}, "
+            f"lambda={header.get('lambda')}) does not match "
+            f"{inst.name}, B={args.budget}, lambda={args.lam}")
+        L0, S0 = (a.astype(np.int64) for a in model.to_arrays(init_pos))
+        init_score = model.score_arrays(L0, S0)
+        if not init_score.feasible:
+            raise ValueError(f"--init {args.init} is infeasible: {init_score.violations}")
+        print(f"warm start from {args.init}: {init_score.objective}", flush=True)
+    
     seeds = DEFAULT_SEEDS if args.solver_seed is None else (args.solver_seed,)
     seed_runs = []
     best = None
     max_vars = 0
     for seed in seeds:
         t0 = time.perf_counter()
-        solver = PartitionSASolver(
-            stages, seed, (args.sa_reads, args.sa_sweeps) if args.integer_polish else None,
-        )
-        # Vary both the random sampler and the partition sequence by seed.
-        result = clamp_and_iterate(
-            model, groups, solver=solver, max_sweeps=args.block_sweeps,
-            patience=args.patience, sweep_offset=seed, verbose=False,
-        )
-        max_vars = max(max_vars, solver.max_qubo_vars)
+        solver = make_solver(seed)
+        if args.time > 0:      # includes its own clamp_and_iterate pass
+            result = iterated_search(model, groups, L=L0, S=S0, time_limit=args.time,
+                                     kick_blocks=args.kick_blocks, kick_size=args.kick_size,
+                                     solver=solver, seed=seed, verbose=False)
+            result.setdefault("blocks", 0); result.setdefault("accepted", result["improvements"])
+            result["history"] = [t[1] for t in result["trace"]]
+        else:
+            result = clamp_and_iterate(model, groups, solver=solver, L=L0, S=S0,
+                                       max_sweeps=args.block_sweeps, patience=args.patience,
+                                       sweep_offset=seed, verbose=False)
+        if args.day_swap > 0:
+            ds = day_swap.run(model, result["L"], result["S"], args.day_swap, seed, verbose=False)
+            if ds["score"] < result["score"]:
+                result.update(score=ds["score"], L=ds["L"], S=ds["S"])
+        stage_calls = getattr(solver, "stage_calls", 0)
+        max_vars = max(max_vars, getattr(solver, "max_qubo_vars", 0))
         score = int(result["score"])
         seed_runs.append({
             "seed": seed, "objective": score, "feasible": True,
             "sub_programs": result["blocks"], "circuits": 0,
             "duration_seconds": round(time.perf_counter() - t0, 3),
-            "stage_calls": solver.stage_calls, "accepted_blocks": result["accepted"],
+            "stage_calls": stage_calls, "accepted_blocks": result["accepted"],
             "block_sweeps": len(result["history"]) - 1,
         })
-        print(f"seed {seed}: {score} ({result['blocks']} block solves, {solver.stage_calls} sampling stages)", flush=True)
+        print(f"seed {seed}: {score} ({result['blocks']} block solves, {stage_calls} sampling stages)", flush=True)
         if best is None or score < best[0]:
             best = (score, seed, result["L"], result["S"])
 

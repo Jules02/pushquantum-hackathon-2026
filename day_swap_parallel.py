@@ -38,6 +38,10 @@ def main() -> None:
     ap.add_argument("--start-round", type=int, default=0, help="first round number (for restarts)")
     ap.add_argument("--out", default="results/day_swap_par")
     args = ap.parse_args()
+    
+    if args.workers < 1 or args.rounds < 1:
+        ap.error("--workers and --rounds must be positive")
+
 
     model = qt.PortfolioModel(qt.load_portfolio_instance(args.instance), budget=args.budget, lam=args.lam)
     _, pos = qt.read_portfolio_solution(args.init)
@@ -54,6 +58,7 @@ def main() -> None:
     best_sol = out / f"{stem}.sol"
     rng = np.random.default_rng(args.seed)
     rec = dict(instance=args.instance, budget=args.budget, lam=args.lam, init=args.init, start=best,
+                seed=args.seed, top=args.top, start_round=args.start_round, solution_file=str(best_sol),
                workers=args.workers, round_seconds=args.round, rounds=[])
     t0 = time.time()
     print(f"{args.instance}: start {best}", flush=True)
@@ -112,6 +117,7 @@ def main() -> None:
         rec["score"] = best
         (out / f"{stem}.json").write_text(json.dumps(rec, indent=2))
         print(f"  round {r}: {before} -> {best} (kept days {sorted(kept)}), {time.time() - t0:.0f}s", flush=True)
+    print("AUTORUNNER_RESULT: " + json.dumps({"score": best, "extra": rec}), flush=True)
 
 
 if __name__ == "__main__":
