@@ -1,1 +1,1 @@
-{"qubits": 9, "method": "Block decomposition + local search"}
+{"qubits": 0, "method": "Classical: whole-day pair-move ILS (day_swap_parallel.py, 16 rounds x 6 day shards; pair-move descent + per-day ILS with ruin/shrink kicks, threshold acceptance, two-day moves); partitioned by period"}

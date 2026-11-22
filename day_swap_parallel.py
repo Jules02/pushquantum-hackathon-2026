@@ -37,6 +37,8 @@ def main() -> None:
     ap.add_argument("--top", type=int, default=0)
     ap.add_argument("--start-round", type=int, default=0, help="first round number (for restarts)")
     ap.add_argument("--out", default="results/day_swap_par")
+    ap.add_argument("--window", type=int, default=2, help="longest multi-day move, in days")
+    ap.add_argument("--two-day", type=float, default=0.2, help="share of multi-day moves")
     args = ap.parse_args()
 
     model = qt.PortfolioModel(qt.load_portfolio_instance(args.instance), budget=args.budget, lam=args.lam)
@@ -73,7 +75,8 @@ def main() -> None:
             od.mkdir(parents=True, exist_ok=True)
             cmd = [sys.executable, "-u", "day_swap.py", "--instance", args.instance, "--budget", str(args.budget),
                    "--lam", args.lam, "--init", str(start), "--time", str(args.round), "--seed", str(seed),
-                   "--top", str(args.top), "--quiet", "--out", str(od), "--days", *map(str, sh)]
+                   "--top", str(args.top), "--quiet", "--out", str(od), "--window", str(args.window),
+                   "--two-day", str(args.two_day), "--days", *map(str, sh)]
             log = open(od / "run.log", "w")
             procs.append((sh, od / f"{stem}_seed{seed}.sol", subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)))
         for _, _, p in procs:

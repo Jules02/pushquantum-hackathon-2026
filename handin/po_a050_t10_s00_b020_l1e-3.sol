@@ -1,8 +1,8 @@
-# day_swap.py: whole-day pair-move descent + per-day ILS from handin/po_a050_t10_s00_b020_l1e-3.sol
+# hybrid: 8 rounds of 150-qubit warm-start QAOA on qoro_cpu (warm_day_qaoa.py loop), then day_swap.py polish (seed 1, 150 s)
 instance po_a050_t10_s00
 budget 20
 lambda 0.001
-objective -191879
+objective -192036
 # period symbol long short
 0 ABT 0 3
 0 ACN 1 0
@@ -20,32 +20,31 @@ objective -191879
 0 WMT 1 0
 1 AAPL 0 3
 1 ABBV 3 0
-1 ABT 0 1
 1 AMZN 1 0
 1 AVGO 1 0
 1 CRM 0 1
 1 IBM 0 1
 1 LLY 0 1
+1 MCD 0 1
 1 META 0 1
 1 MS 2 0
 1 NOW 2 0
-1 PM 0 1
-1 TMUS 2 0
-2 AAPL 0 1
+1 PM 0 2
+1 TMUS 1 0
 2 AMD 0 1
-2 AMZN 1 0
+2 AMZN 2 0
 2 AVGO 1 0
-2 CAT 1 0
-2 CSCO 0 1
-2 GOOGL 0 1
+2 GOOGL 0 2
 2 IBM 0 1
+2 MCD 0 1
 2 META 0 1
 2 MRK 0 2
 2 MSFT 3 0
 2 NOW 2 0
 2 PM 0 1
 2 TSLA 0 1
-2 V 2 0
+2 V 1 0
+2 XOM 1 0
 3 ACN 0 1
 3 COST 0 1
 3 CRM 0 2
@@ -89,33 +88,33 @@ objective -191879
 5 MS 0 1
 5 NVDA 0 1
 5 ORCL 0 1
-6 ABBV 0 2
+6 ABBV 0 3
 6 ADBE 1 0
 6 AMD 1 0
 6 BX 0 3
-6 COST 1 0
 6 CSCO 0 1
-6 GOOG 1 0
+6 HD 1 0
 6 IBM 1 0
+6 MA 0 2
 6 META 0 1
-6 MRK 0 1
 6 MS 0 1
-6 PEP 1 0
+6 ORCL 1 0
 6 TSLA 1 0
-6 V 0 2
+6 UNH 0 1
 6 WFC 2 0
-7 AAPL 0 1
 7 AMD 1 0
 7 AXP 2 0
-7 BX 0 2
+7 BX 0 1
 7 CSCO 0 3
 7 DIS 1 0
-7 GOOG 3 0
+7 GOOG 2 0
 7 HD 0 3
-7 IBM 1 0
-7 ISRG 0 1
+7 ISRG 0 2
+7 LIN 1 0
 7 META 0 1
 7 NFLX 1 0
+7 ORCL 1 0
+7 UNH 0 1
 8 ABBV 2 0
 8 AMD 1 0
 8 BAC 0 3
