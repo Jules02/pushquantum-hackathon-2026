@@ -187,15 +187,38 @@ class QAOABlockSolver:
 
     def __init__(self, layers: int = 2, iters: int = 30, shots: int = 10000, top: int = 64,
                  init: str = "tqa", tqa_dt: float = 1.0, mu_ladder=(0.25, 1.0, 4.0),
-                 backend=None, seed: int = 0, compare_exact: bool = False):
+                 backend=None, seed: int = 0, compare_exact: bool = False,
+                 optimizer: str = "cobyla", population: int = 50, tqa_dt_range=(0.05, 8.0),
+                 tqa_dt_sampling: str = "geom"):
+        """``optimizer="montecarlo"``: MonteCarloOptimizer(population) for ``iters`` iterations;
+        with ``init="tqa"`` its starting population is TQA ramps with dt in
+        geomspace(*tqa_dt_range, population), so the first iteration searches over dt.
+        ``tqa_dt_sampling="random"``: instead, ``population`` uniform draws in tqa_dt_range;
+        ``"stratified"``: one uniform draw in each of ``population`` equal slices of the range
+        (random, but always covering it). Both are seeded by ``seed``: same values for every
+        block of a run."""
         self.layers, self.iters, self.shots, self.top = layers, iters, shots, top
         self.init, self.tqa_dt, self.mu_ladder, self.seed = init, tqa_dt, tuple(mu_ladder), seed
         self.compare_exact = compare_exact
+        self.optimizer, self.population, self.tqa_dt_range = optimizer, population, tuple(tqa_dt_range)
+        self.tqa_dt_sampling = tqa_dt_sampling
+        lo, hi = self.tqa_dt_range
+        rng = np.random.default_rng(seed + 7919)
+        if tqa_dt_sampling == "random":
+            self.dts = np.sort(rng.uniform(lo, hi, population))
+        elif tqa_dt_sampling == "stratified":  # one uniform draw in each of `population` equal slices
+            self.dts = lo + (np.arange(population) + rng.uniform(0, 1, population)) * (hi - lo) / population
+        else:
+            self.dts = np.geomspace(lo, hi, population)
         if backend is None:
             from divi.backends import MaestroSimulator
             backend = MaestroSimulator(shots=shots)
+        if hasattr(backend, "set_seed"):
+            backend.set_seed(seed)
         self.backend = backend
         self.cache: dict = {}
+        self.dt_chosen: list[float] = []
+        self.dt_curves: list[list[float]] = []
         self.stats = dict(calls=0, cache_hits=0, qaoa_runs=0, mu_raised=0, proposals=0,
                           no_feasible=0, qaoa_seconds=0.0, exact_checked=0, exact_hits=0,
                           sample_hits=0, exact_gap=0.0)
@@ -209,7 +232,7 @@ class QAOABlockSolver:
     def _qaoa(self, bqm) -> np.ndarray:
         """Top-``self.top`` bitstrings (K, nq) of QAOA on ``bqm``."""
         from divi.qprog.algorithms import QAOA
-        from divi.qprog.optimizers import ScipyMethod, ScipyOptimizer
+        from divi.qprog.optimizers import MonteCarloOptimizer, ScipyMethod, ScipyOptimizer
         from divi.qprog.problems import BinaryOptimizationProblem
 
         # QAOA needs O(1) energies: rescale (argmin unchanged)
@@ -217,11 +240,20 @@ class QAOABlockSolver:
                     np.abs(list(bqm.quadratic.values()) or [0.0]).max())
         bqm_n = bqm.copy()
         bqm_n.scale(1.0 / scale)
-        q = QAOA(BinaryOptimizationProblem(bqm_n), n_layers=self.layers,
-                 optimizer=ScipyOptimizer(method=ScipyMethod.COBYLA),
+        mc = self.optimizer == "montecarlo"
+        opt = (MonteCarloOptimizer(population_size=self.population) if mc
+               else ScipyOptimizer(method=ScipyMethod.COBYLA))
+        q = QAOA(BinaryOptimizationProblem(bqm_n), n_layers=self.layers, optimizer=opt,
                  max_iterations=self.iters, backend=self.backend, seed=self.seed)
         t0 = time.time()
-        if self.init == "tqa":
+        if self.init == "tqa" and mc:  # Monte Carlo over the TQA time step
+            dts = self.dts
+            q.run(initial_params=np.array([tqa_params(self.layers, dt) for dt in dts]))
+            first = q.losses_history[0]
+            curve = [float(first[str(i)]) for i in range(len(dts))]
+            self.dt_chosen.append(float(dts[int(np.argmin(curve))]))
+            self.dt_curves.append(curve)  # energy (normalised QUBO) vs dt, one per QAOA call
+        elif self.init == "tqa":
             q.run(initial_params=tqa_params(self.layers, self.tqa_dt).reshape(q.get_expected_param_shape()))
         else:  # Divi's default: uniform random angles
             q.run()
@@ -289,9 +321,29 @@ class QAOABlockSolver:
 
     def summary(self) -> dict:
         st = dict(self.stats, layers=self.layers, iters=self.iters, shots=self.shots, top=self.top,
-                  init=self.init, tqa_dt=self.tqa_dt, mu_ladder=list(self.mu_ladder))
+                  init=self.init, tqa_dt=self.tqa_dt, mu_ladder=list(self.mu_ladder),
+                  optimizer=self.optimizer, population=self.population, tqa_dt_sampling=self.tqa_dt_sampling)
         st["qaoa_seconds"] = round(st["qaoa_seconds"], 1)
+        st.update(dt_summary(self.dt_chosen, self.dt_curves, self.tqa_dt_range, self.dts))
         return st
+
+
+def dt_summary(chosen: list[float], curves: list[list[float]], dt_range, dts) -> dict:
+    """Which TQA time steps won, and the mean energy-vs-dt curve (each curve rescaled to 0..1)."""
+    if not chosen:
+        return {}
+    dts = np.asarray(dts, dtype=float)
+    lo, hi = dt_range
+    hist, edges = np.histogram(chosen, bins=np.geomspace(lo, hi, 9) if lo > 0 else np.linspace(lo, hi, 9))
+    out = dict(tqa_dt_range=list(dt_range), dt_chosen_median=float(np.median(chosen)),
+               dt_chosen_hist=dict(counts=hist.tolist(), edges=np.round(edges, 3).tolist()))
+    if curves:
+        C = np.array(curves, dtype=float)
+        span = C.max(1, keepdims=True) - C.min(1, keepdims=True)
+        C = (C - C.min(1, keepdims=True)) / np.where(span > 0, span, 1.0)
+        out.update(dt_grid=np.round(dts, 4).tolist(), dt_curve_mean=np.round(C.mean(0), 4).tolist(),
+                   dt_curve_n=len(curves))
+    return out
 
 
 def run(args):

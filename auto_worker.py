@@ -78,7 +78,10 @@ def main(argv=None) -> int:
     p.add_argument("--size", type=int, default=5, help="asset-group size")
     p.add_argument("--method", default="contiguous",
                    choices=["contiguous", "random", "louvain", "spectral", "neighbourhood"])
-    p.add_argument("--time", type=float, default=120.0, help="iterated-search time limit (s)")
+    p.add_argument("--time", type=float, default=120.0,
+                   help="iterated-search time limit (s); 0 = no clock: sweep blocks until converged, "
+                        "then --kicks kicks")
+    p.add_argument("--kicks", type=int, default=0, help="with --time 0: number of kicks after the sweeps")
     p.add_argument("--kick-blocks", type=int, default=6)
     p.add_argument("--sa-reads", type=int, default=20)
     p.add_argument("--sa-sweeps", type=int, default=2000)
@@ -108,13 +111,16 @@ def main(argv=None) -> int:
     print(f"{args.instance}: {len(inst.symbols)} assets, {inst.n_periods} days; best known {bkv}", flush=True)
 
     pipe_args = argparse.Namespace(lam=args.lam, size=args.size, methods=[args.method], time=args.time,
-                                   kick_blocks=args.kick_blocks, sa_reads=args.sa_reads,
+                                   kick_blocks=args.kick_blocks, kicks=args.kicks, sa_reads=args.sa_reads,
                                    sa_sweeps=args.sa_sweeps, no_sa=args.no_sa, seed=args.seed,
                                    solutions=".", out=".", solver=args.solver,
                                    qaoa_layers=args.qaoa_layers, qaoa_iters=args.qaoa_iters,
                                    qaoa_shots=args.qaoa_shots, qaoa_top=args.qaoa_top,
                                    qaoa_init=args.qaoa_init, tqa_dt=args.tqa_dt,
                                    qaoa_compare_exact=args.qaoa_compare_exact,
+                                   qaoa_optimizer=args.qaoa_optimizer, qaoa_population=args.qaoa_population,
+                                   tqa_dt_range=args.tqa_dt_range, tqa_dt_sampling=args.tqa_dt_sampling,
+                                   qaoa_backend=args.qaoa_backend,
                                    day_blocks=args.day_blocks, day_chains=args.day_chains,
                                    day_sweeps=args.day_sweeps, day_share=args.day_share)
     rec = run_pipeline(model, bkv, pipe_args)

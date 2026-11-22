@@ -3,7 +3,6 @@
 
 # Created when you run the notebooks
 qoblib_data/
-AutoData/
 *.sol
 __pycache__/
 .ipynb_checkpoints/
@@ -15,3 +14,5 @@ qoro_venv/
 !handin/*.sol
 # AutoRunner
 AutoData/
+# Earlier init comparison (auto runner, init_comp, AutoData)
+previous init comp calculations/

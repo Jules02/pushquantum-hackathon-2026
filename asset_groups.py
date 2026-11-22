@@ -347,8 +347,13 @@ def iterated_search(
     verbose: bool = True,
     day_solver: BlockSolver | None = None,
     day_share: float = 0.5,
+    max_kicks: int = 0,
 ) -> dict:
     """Clamp-and-iterate, then repeated kicks + local re-optimisation (keep if better).
+
+    ``time_limit`` <= 0 (or None) removes the clock: the block sweeps run until they stop
+    improving, then exactly ``max_kicks`` kicks / day moves follow (none by default), so the
+    result depends on the seed only, not on run time or machine load.
 
     After a kick only the kicked days and their neighbours are re-optimised (they
     are the only blocks whose surroundings changed); after an accepted kick a full
@@ -364,19 +369,23 @@ def iterated_search(
     ev = BlockEvaluator(model)
     T = model.n_periods
     t0 = time.time()
+    deadline = t0 + time_limit if time_limit and time_limit > 0 else None
+
+    def more() -> bool:  # keep searching: before the deadline, or until max_kicks moves without one
+        return time.time() < deadline if deadline is not None else kicks + day_moves < max_kicks
+
     # The deadline matters for slow block solvers (QAOA); exact sweeps finish far sooner.
     res = clamp_and_iterate(model, groups, solver, L=L, S=S, max_sweeps=200, patience=3, verbose=False,
-                            deadline=t0 + time_limit)
+                            deadline=deadline)
     best_L, best_S, best = res["L"], res["S"], res["score"]
     start_score = best
     trace = [(round(time.time() - t0, 1), best)]
     kicks = improvements = day_moves = day_improvements = 0
     offset = 1000
-    deadline = t0 + time_limit
     all_assets = [np.arange(len(model.symbols))]
     whole_day = lambda sweep: all_assets  # noqa: E731
     if day_solver is not None:
-        while time.time() < deadline:  # polish: whole days <-> small blocks
+        while deadline is None or time.time() < deadline:  # polish: whole days <-> small blocks
             before = best
             r = clamp_and_iterate(model, whole_day, day_solver, L=best_L, S=best_S, max_sweeps=20,
                                   patience=1, verbose=False, deadline=deadline)
@@ -389,7 +398,7 @@ def iterated_search(
                 break
     polish_score = best
     t_day = t_kick = 0.0
-    while time.time() - t0 < time_limit:
+    while more():
         if day_solver is not None and t_day <= day_share * (t_day + t_kick):
             t1 = time.time()
             t = int(rng.integers(T))
@@ -417,13 +426,13 @@ def iterated_search(
         offset += 1
         r = clamp_and_iterate(model, groups, solver, L=L2, S=S2, max_sweeps=50, patience=1,
                               verbose=False, days_subset=near, sweep_offset=offset,
-                              deadline=t0 + time_limit)
+                              deadline=deadline)
         kicks += 1
         if r["score"] < best:
             offset += 1
             r = clamp_and_iterate(model, groups, solver, L=r["L"], S=r["S"], max_sweeps=50,
                                   patience=1, verbose=False, sweep_offset=offset,
-                                  deadline=t0 + time_limit)
+                                  deadline=deadline)
             best_L, best_S, best = r["L"], r["S"], r["score"]
             improvements += 1
             trace.append((round(time.time() - t0, 1), best))
@@ -633,6 +642,16 @@ def add_solver_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--qaoa-init", choices=["tqa", "random"], default="tqa",
                     help="starting angles: TQA ramp (default) or Divi's uniform random")
     ap.add_argument("--tqa-dt", type=float, default=1.0, help="TQA time step per layer")
+    ap.add_argument("--qaoa-optimizer", choices=["cobyla", "montecarlo"], default="cobyla",
+                    help="cobyla, or MonteCarloOptimizer (--qaoa-population, --qaoa-iters iterations)")
+    ap.add_argument("--qaoa-population", type=int, default=50, help="Monte Carlo population size")
+    ap.add_argument("--tqa-dt-range", type=float, nargs=2, default=[0.05, 8.0], metavar=("LO", "HI"),
+                    help="montecarlo + tqa: starting population = TQA ramps with dt in geomspace(LO, HI)")
+    ap.add_argument("--tqa-dt-sampling", choices=["geom", "random", "stratified"], default="geom",
+                    help="montecarlo + tqa: dt values on a log grid, uniform random draws, or one "
+                         "random draw per equal slice of the range (seeded)")
+    ap.add_argument("--qaoa-backend", choices=["cpu", "gpu"], default="cpu",
+                    help="local Maestro simulator on CPU (default) or GPU")
     ap.add_argument("--qaoa-compare-exact", action="store_true",
                     help="diagnostic: also enumerate each block to count how often QAOA hits its optimum")
     ap.add_argument("--day-blocks", action="store_true",
@@ -649,9 +668,19 @@ def make_solver(args):
         return solve_block_exact, lambda: dict(name="exact")
     from qaoa_signed_blocks import QAOABlockSolver  # imports this module: keep it lazy
 
+    backend = None
+    if getattr(args, "qaoa_backend", "cpu") == "gpu":
+        from divi.backends import MaestroConfig, MaestroSimulator
+
+        backend = MaestroSimulator(shots=args.qaoa_shots,
+                                   maestro_config=MaestroConfig(simulator_type="Gpu"))  # type: ignore[call-arg]
     s = QAOABlockSolver(layers=args.qaoa_layers, iters=args.qaoa_iters, shots=args.qaoa_shots,
                         top=args.qaoa_top, init=args.qaoa_init, tqa_dt=args.tqa_dt,
-                        seed=args.seed, compare_exact=args.qaoa_compare_exact)
+                        seed=args.seed, compare_exact=args.qaoa_compare_exact, backend=backend,
+                        optimizer=getattr(args, "qaoa_optimizer", "cobyla"),
+                        population=getattr(args, "qaoa_population", 50),
+                        tqa_dt_range=getattr(args, "tqa_dt_range", (0.05, 8.0)),
+                        tqa_dt_sampling=getattr(args, "tqa_dt_sampling", "geom"))
     return s, lambda: dict(name="qaoa", **s.summary())
 
 
@@ -680,7 +709,8 @@ def run_pipeline(model: qt.PortfolioModel, bkv, args) -> dict:
         day_solver = SABlockSolver(chains=args.day_chains, sweeps=args.day_sweeps, seed=args.seed)
     r = iterated_search(model, groups, L=L, S=S, time_limit=args.time, kick_blocks=args.kick_blocks,
                         kick_size=args.size, solver=solver, seed=args.seed, verbose=False,
-                        day_solver=day_solver, day_share=getattr(args, "day_share", 0.5))
+                        day_solver=day_solver, day_share=getattr(args, "day_share", 0.5),
+                        max_kicks=getattr(args, "kicks", 0))
     rec["solver"] = describe()
     if day_solver is not None:
         rec["day_blocks"] = dict(day_solver.summary(), share=args.day_share, moves=r["day_moves"],
