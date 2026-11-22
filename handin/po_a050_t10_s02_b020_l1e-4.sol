@@ -1,8 +1,8 @@
-# asset groups of 3 (random) + iterated search, SA start
+# day_swap.py: whole-day pair-move descent + per-day ILS from handin/po_a050_t10_s02_b020_l1e-4.sol
 instance po_a050_t10_s02
 budget 20
 lambda 0.0001
-objective -443266
+objective -443357
 # period symbol long short
 0 ACN 0 3
 0 ADBE 0 2
@@ -34,28 +34,26 @@ objective -443266
 2 NFLX 1 0
 2 PEP 0 3
 2 TSLA 1 0
-3 ABT 1 0
+3 ABT 2 0
+3 ADBE 1 0
 3 AMD 0 1
 3 AVGO 0 3
-3 COST 0 1
 3 CSCO 1 0
 3 DIS 1 0
-3 GOOGL 3 0
-3 LLY 0 2
-3 NOW 1 0
-3 NVDA 1 0
+3 GOOGL 2 0
+3 LLY 0 3
+3 NVDA 2 0
 3 TSLA 0 1
 3 UNH 3 0
-3 WFC 1 0
 4 AAPL 0 3
 4 ABBV 2 0
 4 ABT 3 0
 4 COST 3 0
 4 DIS 0 3
+4 HD 1 0
 4 NVDA 1 0
 4 PM 0 1
 4 TSLA 0 3
-4 WFC 1 0
 5 AMD 0 1
 5 BX 1 0
 5 CVX 2 0
