@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 """``auto_runner.py`` worker for our pipeline (SA start -> asset-group blocks -> iterated search).
 
-    python auto_runner.py auto_worker.py --tests local_size_tests --silent --worker-args "--time 300"
+    python auto_runner.py auto_worker.py --tests local_size_tests --silent -- --time 300
     python auto_runner.py auto_worker.py --tests local_size_tests --silent \
-        --worker-args "--solver qaoa --size 4 --time 600"   # QAOA blocks, TQA start
+        -- --solver qaoa --size 4 --time 600   # QAOA blocks, TQA start
 
 The runner calls this once per instance from its run directory with
 
-    --instance po_a050_t10_orig_b020_l1e-3 --data-dir <rel. path to instances/po_a050_t10_orig>
-    --assets 50 --days 10 --lam 1e-3 --budget 20 --cloud false  [pipeline options]
+    --instance po_a050_t10_orig_b020_l1e-3 --instance-dir <rel. path to instances/po_a050_t10_orig>
+    --assets 50 --days 10 --lambda 1e-3 --budget 20 --cloud false [--solver-seed N]
 
 and we write, in the working directory, ``<instance>.sol``, ``pipeline_*.json`` and
 ``<instance>.result.json`` (``{"score", "best_sol", "extra"}``). The default
@@ -67,10 +67,10 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--postprocess", nargs=2, metavar=("RUN_DIR", "RUN_JSON"))
     p.add_argument("--instance")
-    p.add_argument("--data-dir")
+    p.add_argument("--instance-dir", "--data-dir", dest="data_dir")
     p.add_argument("--assets", type=int)
     p.add_argument("--days", type=int)
-    p.add_argument("--lam")
+    p.add_argument("--lambda", "--lam", dest="lam")
     p.add_argument("--budget", type=int)
     p.add_argument("--cloud", default="false",
                    help="ignored: QAOA blocks (--solver qaoa) run on the local Maestro simulator")
@@ -83,13 +83,21 @@ def main(argv=None) -> int:
                         "then --kicks kicks")
     p.add_argument("--kicks", type=int, default=0, help="with --time 0: number of kicks after the sweeps")
     p.add_argument("--kick-blocks", type=int, default=6)
+    p.add_argument("--kick-one-day", action="store_true", help="put all kicked blocks on one day")
     p.add_argument("--sa-reads", type=int, default=20)
     p.add_argument("--sa-sweeps", type=int, default=2000)
-    p.add_argument("--no-sa", action="store_true", help="start from an empty portfolio (use on a400)")
+    start = p.add_mutually_exclusive_group()
+    start.add_argument("--no-sa", action="store_true", help="start from an empty portfolio (use on a400)")
+    start.add_argument("--init", help="start from a feasible .sol file instead of whole-QUBO SA")
     p.add_argument("--seed", type=int, default=1909)
+    p.add_argument("--solver-seed", type=int, help="seed supplied by AutoRunner (overrides --seed)")
 
     add_solver_args(p)
     args = p.parse_args(argv)
+    if args.solver_seed is not None:
+        args.seed = args.solver_seed
+    if not 0 < args.day_tscale < float("inf"):
+        p.error("--day-tscale must be finite and positive")
     if args.postprocess:
         print("auto_worker: no post-processing")
         return 0
@@ -110,6 +118,7 @@ def main(argv=None) -> int:
     bkv = best_known(po_base, args.budget, args.lam)
     print(f"{args.instance}: {len(inst.symbols)} assets, {inst.n_periods} days; best known {bkv}", flush=True)
 
+<<<<<<< HEAD
     pipe_args = argparse.Namespace(lam=args.lam, size=args.size, methods=[args.method], time=args.time,
                                    kick_blocks=args.kick_blocks, kicks=args.kicks, sa_reads=args.sa_reads,
                                    sa_sweeps=args.sa_sweeps, no_sa=args.no_sa, seed=args.seed,
@@ -123,14 +132,18 @@ def main(argv=None) -> int:
                                    qaoa_backend=args.qaoa_backend,
                                    day_blocks=args.day_blocks, day_chains=args.day_chains,
                                    day_sweeps=args.day_sweeps, day_share=args.day_share)
+=======
+    pipe_args = argparse.Namespace(**vars(args), methods=[args.method], solutions=".", out=".")
+>>>>>>> 6784ddb605f5e27c6b76dfaf32d6f6393abe1352
     rec = run_pipeline(model, bkv, pipe_args)
+    rec["kick_one_day"] = args.kick_one_day
     sol = Path(rec["solution_file"])
     if sol.name != f"{args.instance}.sol":  # run_pipeline names it <po_base>_bBBB_l<lam>.sol
         sol = sol.rename(f"{args.instance}.sol")
     rec.pop("trace", None)
     payload = {"score": rec["score"], "best_sol": sol.name, "extra": rec}
     Path(f"{args.instance}.result.json").write_text(json.dumps(payload, indent=2, default=float), encoding="utf-8")
-    print("AUTORUNNER_RESULT " + json.dumps({"score": payload["score"], "best_sol": payload["best_sol"]}), flush=True)
+    print("AUTORUNNER_RESULT: " + json.dumps(payload, default=float), flush=True)
     return 0
 
 

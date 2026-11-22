@@ -30,6 +30,6 @@ store = aqora.Store()
 store.put(f"pushquantum-2026-qoro/{name}.sol", sol_path.read_bytes())
 store.put(
     f"pushquantum-2026-qoro/{name}.json",
-    json.dumps({"qubits": 12, "method": "super secret method"}).encode(),
+    json.dumps({"qubits": 12, "method": "bringing the quantum heat!"}).encode(),
     content_type="application/json",
 )

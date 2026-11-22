@@ -85,7 +85,7 @@ def solve_exact(F: dict, chunk: int = 200_000) -> np.ndarray:
 
 
 def solve_sa(F: dict, v0: np.ndarray, rng, chains: int = 64, sweeps: int = 300,
-             t_hi: float | None = None, t_lo: float | None = None) -> np.ndarray:
+             t_hi: float | None = None, t_lo: float | None = None, t_scale: float = 1.0) -> np.ndarray:
     """Integer SA from the feasible ``v0``; every move keeps the rules, so chains stay feasible.
 
     Moves: set one asset to a random other value, or shift two assets by ±1 each (needed
@@ -101,7 +101,7 @@ def solve_sa(F: dict, v0: np.ndarray, rng, chains: int = 64, sweeps: int = 300,
     best_c, best_v = cost.min(), V[int(np.argmin(cost))].copy()
     if t_hi is None:
         spread = np.ptp(f + np.diag(A)[:, None] * VALS ** 2, axis=1)
-        t_hi = float(np.median(spread)) or 1.0
+        t_hi = (float(np.median(spread)) or 1.0) * t_scale
     t_lo = t_hi / 1000 if t_lo is None else t_lo
     steps = sweeps * g
     temps = t_hi * (t_lo / t_hi) ** (np.arange(steps) / max(1, steps - 1))
@@ -154,8 +154,8 @@ class SABlockSolver:
     the same block again can find a different (better) holding.
     """
 
-    def __init__(self, chains: int = 64, sweeps: int = 300, seed: int = 0):
-        self.chains, self.sweeps = chains, sweeps
+    def __init__(self, chains: int = 64, sweeps: int = 300, seed: int = 0, t_scale: float = 1.0):
+        self.chains, self.sweeps, self.t_scale = chains, sweeps, t_scale
         self.rng = np.random.default_rng(seed)
         self.calls, self.seconds = 0, 0.0
 
@@ -171,13 +171,13 @@ class SABlockSolver:
             v0 = np.zeros(len(G), np.int64)
             if not form_cost(F, v0[None])[1][0]:
                 return BlockResult((L[days[0], G] - S[days[0], G]).astype(np.int64))
-        V = solve_sa(F, v0, self.rng, chains=self.chains, sweeps=self.sweeps)
+        V = solve_sa(F, v0, self.rng, chains=self.chains, sweeps=self.sweeps, t_scale=self.t_scale)
         self.calls += 1
         self.seconds += time.time() - t0
         return BlockResult(V)
 
     def summary(self) -> dict:
-        return dict(chains=self.chains, sweeps=self.sweeps, calls=self.calls, seconds=round(self.seconds, 1))
+        return dict(chains=self.chains, sweeps=self.sweeps, t_scale=self.t_scale, calls=self.calls, seconds=round(self.seconds, 1))
 
 
 # ── data ─────────────────────────────────────────────────────────────────

@@ -1,35 +1,42 @@
-#!/usr/bin/env python
-"""Auto runner: execute a solver script on many QOBLIB portfolio instances (spec: AutoRunner.md).
+#!/usr/bin/env python3
+"""Automated multi-instance runner for QOBLIB Portfolio Optimization solvers.
 
-    python auto_runner.py WORKER.py --tests local_size_tests            # test by name
-    python auto_runner.py WORKER.py --tests 0 4 --seed s01 --risk 6      # tests by index, data seed, λ index
-    python auto_runner.py WORKER.py --tests 0 --solver-seeds 1 2 3       # multiple solver seeds (default: 1909)
-    python auto_runner.py WORKER.py --tests all                          # every test, every data seed
-    python auto_runner.py WORKER.py --manual 12 20                       # rows of the QOBLIB table (--list)
-    python auto_runner.py WORKER.py --tests cloud_size_tests --cloud     # Qoro cloud instead of local
-    python auto_runner.py WORKER.py --list                               # tests, λ values, table rows
-    python auto_runner.py WORKER.py --tests CompareToBest --dry-run      # show the plan, run nothing
+Executes a target solver script across predefined benchmark suites or manually
+selected rows from ``qoblib_instance_benchmarks.csv``, manages local resource
+budgeting or Qoro cloud credit checks, launches tasks in parallel (silently or
+in OS-agnostic visible terminal windows), validates produced ``.sol`` files via
+``solution_checker.py``, and aggregates all metrics into a non-overwriting JSON
+report inside ``AutoData/<test_name>_<HHMM>/``.
 
-WORKER contract
----------------
-The runner starts ``python WORKER.py`` once per (instance, solver seed), from a per-seed
-working directory under ``AutoData/<test>_<HHMM>/``, in its own terminal (or hidden with
-``--silent``), with::
+Target Solver CLI Contract
+--------------------------
+Each instance task is launched with its working directory set to the run's
+output directory (``AutoData/<run_dir>/``) and ``PYTHONPATH`` including the
+repository root. ``auto_runner.py`` invokes the target Python script as::
 
-    --instance po_a010_t10_orig_b004_l1e-4    full instance name
-    --data-dir ../../../instances/po_a010_t10_orig  instance data, relative to working directory
-    --assets 10 --days 10 --lam 1e-4 --budget 4   parameters that define the instance
-    --cloud false                                 true = run on Qoro's cloud
-    --seed 1909                                   solver RNG seed (also AUTORUNNER_SOLVER_SEED)
+    python <target_script.py> \\
+        --instance <full_instance_name> \\
+        --instance-dir <relative_path_to_instance_dir> \\
+        --assets <int> \\
+        --days <int> \\
+        --lambda <str_value> \\
+        --budget <int> \\
+        --cloud <true|false> \\
+        [--solver-seed <int>]   # included when --solver-seeds is used
 
-The worker writes ``<instance>.sol`` into its working directory and reports, as one stdout line::
+Expected outputs from the target script:
+  1. Indirect: writes a ``.sol`` file in the current working directory named
+     ``<full_instance_name>.sol`` (e.g. ``po_a010_t10_orig_b004_l1e-4.sol``).
+  2. Direct (stdout): optionally prints a JSON object (either the entire stdout,
+     a line prefixed with ``AUTORUNNER_RESULT:``, or the final JSON object in
+     stdout) containing ``score`` (numeric) and/or ``extra`` (arbitrary JSON
+     object). Plain ``score`` + JSON output is also accepted.
 
-    AUTORUNNER_RESULT {"score": -69372, "best_sol": "po_a010_t10_orig_b004_l1e-4.sol", "extra": {...}}
-
-(or the same JSON in ``<instance>.result.json``). ``best_sol`` defaults to ``<instance>.sol``.
-When multiple ``--solver-seeds`` are supplied, only the best ``.sol`` per instance is kept in
-``AutoData/<test>_<HHMM>/<instance>.sol``, while scores for all seeds are recorded in the report JSON.
+Pass solver-specific options after ``--``. ``auto_worker.py``, ``day_swap.py``
+and ``day_swap_parallel.py`` accept a warm-start ``--init`` with a .sol file
+or a directory containing ``<full_instance_name>.sol`` for each task.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -45,734 +52,2941 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
-from dataclasses import dataclass, field
-from fractions import Fraction
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
-REPO = Path(__file__).resolve().parent
-AUTODATA = REPO / "AutoData"
-INSTANCES_DIR = REPO / "instances"
-CSV_PATH = REPO / "qoblib_instance_benchmarks.csv"
-CHECKER = REPO / "solution_checker.py"
+try:
+    import psutil
+except ImportError:  # pragma: no cover
+    psutil = None  # type: ignore[assignment]
 
-RESULT_MARKER = "AUTORUNNER_RESULT "
 
-# Risk λ, indexed 0..7 (spelled as in QOBLIB's file names, e.g. po_a010_t10_orig_b004_l1e-4.sol).
-RISKS = ["0", "1e-6", "1e-5", "5e-5", "1e-4", "5e-4", "1e-3", "1e-2"]
-DEFAULT_RISK = 4  # 1e-4
-DEFAULT_SOLVER_SEED = 1909
-SEEDS = ["orig", "s00", "s01", "s02"]  # data seeds that exist in instances/
+# ---------------------------------------------------------------------------
+# Constants & Benchmark Metadata
+# ---------------------------------------------------------------------------
 
-# The tests of AutoRunner.md, in its order (index = position). "XX" = --seed; entries without
-# "_l…" take λ from --risk. Spec typos normalised: "p0_a10_…" → "a010_…", "l1e-05" → 1e-5.
-TESTS: dict[str, list[str]] = {
-    "CompareToBest": ["a010_t10_s02_b004_l1e-05", "a010_t15_XX_b004", "a050_t10_s02_b020_l0"],
-    "CompareToOptimal": ["a010_t10_s02_b004_l1e-05", "a010_t15_orig_b004_l1e-06", "a050_t15_s02_b020_l0"],
-    "local_size_tests": ["a010_t10_XX_b004", "a050_t10_XX_b020", "a200_t10_XX_b050"],
-    "cloud_size_tests": ["a050_t15_XX_b020", "a200_t15_XX_b050", "a400_t15_XX_b100"],
-    "local_small_risk_tests": ["a010_t10_XX_b004_l1e-06", "a010_t10_XX_b004_l1e-04", "a010_t10_XX_b004_l1e-02"],
-    "local_big_risk_tests": ["a050_t15_XX_b020_l1e-06", "a050_t15_XX_b020_l1e-04", "a050_t15_XX_b020_l1e-02"],
-    "cloud_small_risk_tests": ["a200_t15_XX_b050_l1e-06", "a200_t15_XX_b050_l1e-04", "a200_t15_XX_b050_l1e-02"],
-    "cloud_big_risk_tests": ["a400_t15_XX_b100_l1e-06", "a400_t15_XX_b100_l1e-04", "a400_t15_XX_b100_l1e-02"],
+REPO_ROOT = Path(__file__).resolve().parent
+BENCHMARKS_CSV = REPO_ROOT / "qoblib_instance_benchmarks.csv"
+INSTANCES_DIR = REPO_ROOT / "instances"
+QOBLIB_DATA_INSTANCES_DIR = REPO_ROOT / "qoblib_data" / "06-portfolio" / "instances"
+SUBMISSIONS_DIR = REPO_ROOT / "submissions"
+SOLUTION_CHECKER = REPO_ROOT / "solution_checker.py"
+DAY_SWAP_SCRIPTS = {"day_swap.py", "day_swap_parallel.py"}
+WARM_START_SCRIPTS = DAY_SWAP_SCRIPTS | {"auto_worker.py"}
+AUTODATA_DIR = REPO_ROOT / "AutoData"
+
+# Hardcoded risk-aversion lambda grid (indexed 0..7)
+RISK_LAMBDAS: tuple[float, ...] = (
+    0.0,
+    1e-6,
+    1e-5,
+    5e-5,
+    1e-4,
+    5e-4,
+    1e-3,
+    1e-2,
+)
+RISK_LAMBDA_TAGS: tuple[str, ...] = (
+    "0",
+    "1e-6",
+    "1e-5",
+    "5e-5",
+    "1e-4",
+    "5e-4",
+    "1e-3",
+    "1e-2",
+)
+DEFAULT_RISK_INDEX = 4  # 1e-4
+
+VALID_SEEDS: tuple[str, ...] = ("orig", "s00", "s01", "s02")
+DEFAULT_SEED = "orig"
+DEFAULT_SOLVER_SEEDS: tuple[int, ...] = (1, 2, 3)
+
+BUDGET_BY_ASSETS: dict[int, int] = {
+    3: 3,
+    4: 4,
+    5: 4,
+    10: 4,
+    50: 20,
+    200: 50,
+    400: 100,
 }
-TEST_NAMES = list(TESTS)
-SEED_FIXED_TESTS = {"CompareToOptimal"}  # "This overwrites the Seed parameter!"
 
-NAME_RE = re.compile(r"^(?:po_|p0_)?a(\d+)_t(\d+)_(orig|s\d\d|XX)_b(\d+)(?:_l([0-9.eE+-]+))?$")
+# Predefined test suites in the exact order specified in AutoRunner.md
+TEST_SUITES_ORDERED: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "CompareToBest",
+        (
+            "a010_t10_s02_b004_l1e-05",
+            "p0_a10_t15_XX_b004",
+            "a050_t10_s02_b020_l0",
+        ),
+    ),
+    (
+        "CompareToOptimal",
+        (
+            "a010_t10_s02_b004_l1e-05",
+            "a010_t15_orig_b004_l1e-06",
+            "a050_t15_s02_b020_l0",
+        ),
+    ),
+    (
+        "local_size_tests",
+        (
+            "po_a010_t10_XX_b004",
+            "po_a050_t10_XX_b020",
+            "p0_a200_t10_XX_b050",
+        ),
+    ),
+    (
+        "cloud_size_tests",
+        (
+            "po_a050_t15_XX_b020",
+            "po_a200_t15_XX_b050",
+            "po_a400_t15_XX_b100",
+        ),
+    ),
+    (
+        "local_small_risk_tests",
+        (
+            "a010_t10_XX_b004_l1e-06",
+            "a010_t10_XX_b004_l1e-04",
+            "a010_t10_XX_b004_l1e-02",
+        ),
+    ),
+    (
+        "local_big_risk_tests",
+        (
+            "a050_t15_XX_b020_l1e-06",
+            "a050_t15_XX_b020_l1e-04",
+            "a050_t15_XX_b020_l1e-02",
+        ),
+    ),
+    (
+        "cloud_small_risk_tests",
+        (
+            "a200_t15_XX_b050_l1e-06",
+            "a200_t15_XX_b050_l1e-04",
+            "a200_t15_XX_b050_l1e-02",
+        ),
+    ),
+    (
+        "cloud_big_risk_tests",
+        (
+            "a400_t15_XX_b100_l1e-06",
+            "a400_t15_XX_b100_l1e-04",
+            "a400_t15_XX_b100_l1e-02",
+        ),
+    ),
+    ("all", ()),  # Dynamically populated from all rows in qoblib_instance_benchmarks.csv
+)
 
-# Resource model, scaled from notebook 01: po_a010_t10_orig (710 variables) → 70 sub-programs ×
-# 501 circuits ≈ 35 000 circuits per run, "under a minute" locally.
-REF_VARS, REF_SUBPROGRAMS, CIRCUITS_PER_SUBPROGRAM, REF_MINUTES = 710, 70, 501, 1.0
-CORES_PER_TASK = 2  # a Divi/Maestro worker keeps about two cores busy
+TEST_SUITE_NAMES: tuple[str, ...] = tuple(name for name, _ in TEST_SUITES_ORDERED)
+TEST_SUITES_MAP: dict[str, tuple[str, ...]] = dict(TEST_SUITES_ORDERED)
+
+# Regex matching all instance formats in AutoRunner.md and qoblib_instance_benchmarks.csv
+INSTANCE_SPEC_RE = re.compile(
+    r"^(?:p[o0]_)?"
+    r"a(?P<assets>\d+)_"
+    r"t(?P<days>\d+)_"
+    r"(?P<seed>orig|s\d+|XX)"
+    r"(?:_b(?P<budget>\d+))?"
+    r"(?:_l(?P<lam>[0-9eE.+-]+))?$"
+)
+
+CSV_PARAMS_RE = re.compile(
+    r"Assets\s+(?P<assets>\d+)\s*·\s*Periods\s+(?P<days>\d+)\s*·\s*Budget\s+(?P<budget>\d+)"
+)
+
+LOW_CREDIT_THRESHOLD_DEFAULT = 100.0
+CLOUD_MAX_PARALLEL_DEFAULT = 3
+
+# GPU monitoring & anti-throttling defaults
+GPU_MAX_UTIL_DEFAULT = 85.0
+GPU_VRAM_HEADROOM_PCT_DEFAULT = 15.0
+GPU_MAX_TEMP_C_DEFAULT = 82.0
+GPU_TEMP_HYSTERESIS_C = 3.0
+GPU_POLL_INTERVAL_S = 0.5
+GPU_WARMUP_RESERVATION_S = 5.0
+GPU_THROTTLE_COOLDOWN_S = 5.0
+
+# NVIDIA clocks_throttle_reasons.active bits that indicate real thermal/power throttling
+# (ignores 0x1 GPU Idle and 0x2 Applications Clocks Setting)
+_NV_THROTTLE_MASK = 0x0000000000000004 | 0x0000000000000008 | 0x0000000000000020 | 0x0000000000000040 | 0x0000000000000080
 
 
-# ── instances ──────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Data Models
+# ---------------------------------------------------------------------------
 
 
-def norm_lam(text: str) -> str:
-    """'1e-05' / '0.0001' / '1e-4' → the canonical spelling in RISKS."""
-    value = float(text)
-    for r in RISKS:
-        if float(r) == value:
-            return r
-    raise ValueError(f"λ = {text} is not one of {RISKS}")
+@dataclass(frozen=True)
+class CsvBenchmarkRow:
+    """One row from ``qoblib_instance_benchmarks.csv``."""
+
+    index: int
+    problem_id: str
+    problem: str
+    instance: str  # e.g. a010_t10_orig_b004
+    parameters: str  # e.g. Assets 10 · Periods 10 · Budget 4
+    assets: int
+    days: int
+    budget: int
+    best_objective: int | float | None
+    optimal: str
+    source: str
+    source_url: str
+    status: str
+    raw_url: str
 
 
-@dataclass
-class Task:
-    name: str      # po_a010_t10_orig_b004_l1e-4
-    base: str      # po_a010_t10_orig   (instances/<base>/ holds the data)
+@dataclass(frozen=True)
+class InstanceTask:
+    """Fully resolved portfolio optimization instance to execute."""
+
     assets: int
     days: int
     seed: str
     budget: int
-    lam: str
+    lam: float
+    lam_tag: str
+    raw_spec: str
+    solver_seed: int | None = None
 
     @property
-    def n_vars(self) -> int:  # official QUBO: 6nT position bits + (4 cash + 7 budget) slack bits per day
-        return 6 * self.assets * self.days + 11 * self.days
+    def base_name(self) -> str:
+        """Physical directory name under ``instances/`` (e.g. ``po_a010_t10_orig``)."""
+        return f"po_a{self.assets:03d}_t{self.days:02d}_{self.seed}"
 
     @property
-    def subprograms(self) -> int:
-        return math.ceil(self.n_vars * REF_SUBPROGRAMS / REF_VARS)
+    def csv_instance_key(self) -> str:
+        """Key matching ``Instance`` column in ``qoblib_instance_benchmarks.csv``."""
+        return f"a{self.assets:03d}_t{self.days:02d}_{self.seed}_b{self.budget:03d}"
 
     @property
-    def circuits(self) -> int:
-        return self.subprograms * CIRCUITS_PER_SUBPROGRAM
+    def csv_parameters_key(self) -> str:
+        """Key matching ``Parameters`` column in ``qoblib_instance_benchmarks.csv``."""
+        return f"Assets {self.assets} · Periods {self.days} · Budget {self.budget}"
 
     @property
-    def est_minutes(self) -> float:
-        return REF_MINUTES * self.subprograms / REF_SUBPROGRAMS
+    def full_name(self) -> str:
+        """Canonical full instance name including budget and lambda."""
+        return f"{self.base_name}_b{self.budget:03d}_l{self.lam_tag}"
 
     @property
-    def est_mb(self) -> float:  # the dense intra-day risk block ((6n)² couplings per day) dominates
-        return 400 + 3.6e-5 * (6 * self.assets) ** 2 * self.days
+    def run_key(self) -> str:
+        """Unique identifier for one scheduled task (distinguishes solver RNG seeds)."""
+        if self.solver_seed is None:
+            return self.full_name
+        return f"{self.full_name}__seed{self.solver_seed}"
 
     @property
-    def csv_instance(self) -> str:  # a010_t10_orig_b004, as in the CSV's "Instance" column
-        return f"{self.base[3:]}_b{self.budget:03d}"
+    def display_name(self) -> str:
+        """Human-readable task label for logs."""
+        if self.solver_seed is None:
+            return self.full_name
+        return f"{self.full_name} [solver_seed={self.solver_seed}]"
+
+    @property
+    def instance_dir(self) -> Path:
+        return INSTANCES_DIR / self.base_name
+
+    @property
+    def estimated_qubo_vars(self) -> int:
+        """Official QOBLIB portfolio QUBO variable count: T * (6*N + 11)."""
+        return self.days * (6 * self.assets + 11)
 
 
-def make_task(text: str, seed: str, lam_default: str) -> Task:
-    m = NAME_RE.match(text.strip())
-    if not m:
-        raise ValueError(f"cannot parse instance name {text!r}")
-    a, t, xx, b, lam = m.groups()
-    xx = seed if xx == "XX" else xx
-    base = f"po_a{int(a):03d}_t{int(t):02d}_{xx}"
-    lam = norm_lam(lam) if lam else lam_default
-    return Task(f"{base}_b{int(b):03d}_l{lam}", base, int(a), int(t), xx, int(b), lam)
+@dataclass
+class GPUDeviceStatus:
+    """Live telemetry snapshot for one local GPU device."""
+
+    index: int
+    name: str
+    backend: str  # "cuda", "rocm", "mps"
+    total_vram_gb: float
+    free_vram_gb: float
+    used_vram_gb: float
+    utilization_pct: float | None = None
+    temperature_c: float | None = None
+    power_draw_w: float | None = None
+    power_limit_w: float | None = None
+    throttling: bool = False
+    throttle_reason: str | None = None
+    unified_memory: bool = False
+
+    @property
+    def device_str(self) -> str:
+        if self.backend == "mps":
+            return "mps"
+        return f"{self.backend}:{self.index}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "name": self.name,
+            "backend": self.backend,
+            "device": self.device_str,
+            "total_vram_gb": round(self.total_vram_gb, 2),
+            "free_vram_gb": round(self.free_vram_gb, 2),
+            "used_vram_gb": round(self.used_vram_gb, 2),
+            "utilization_pct": (
+                round(self.utilization_pct, 1) if self.utilization_pct is not None else None
+            ),
+            "temperature_c": (
+                round(self.temperature_c, 1) if self.temperature_c is not None else None
+            ),
+            "power_draw_w": (
+                round(self.power_draw_w, 1) if self.power_draw_w is not None else None
+            ),
+            "power_limit_w": (
+                round(self.power_limit_w, 1) if self.power_limit_w is not None else None
+            ),
+            "throttling": self.throttling,
+            "throttle_reason": self.throttle_reason,
+            "unified_memory": self.unified_memory,
+        }
 
 
-def tasks_for_test(test: str, seeds: list[str], lam: str) -> list[Task]:
-    tasks, seen = [], set()
-    for entry in TESTS[test]:
-        for seed in (["orig"] if test in SEED_FIXED_TESTS else seeds):
-            task = make_task(entry, seed, lam)
-            if task.name not in seen:
-                seen.add(task.name)
-                tasks.append(task)
-    return tasks
+@dataclass(frozen=True)
+class GPUThrottlePolicy:
+    """Configuration controlling passive GPU monitoring and anti-throttling guardrails."""
+
+    enabled: bool = True
+    max_util_pct: float = GPU_MAX_UTIL_DEFAULT
+    vram_headroom_pct: float = GPU_VRAM_HEADROOM_PCT_DEFAULT
+    max_temp_c: float = GPU_MAX_TEMP_C_DEFAULT
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "max_util_pct": self.max_util_pct,
+            "vram_headroom_pct": self.vram_headroom_pct,
+            "max_temp_c": self.max_temp_c,
+        }
 
 
-def load_csv() -> list[dict]:
-    with open(CSV_PATH, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+@dataclass
+class TaskExecutionResult:
+    """Collected runtime, checker, and benchmark output for one instance task."""
+
+    task: InstanceTask
+    start_time: str
+    end_time: str
+    duration_seconds: float
+    exit_code: int
+    stdout: str
+    stderr: str
+    credits_used: float | None = None
+    best_solution_file: str | None = None
+    solution_rel_path: str | None = None
+    reported_score: int | float | None = None
+    checker_result: dict[str, Any] | None = None
+    best_known_score: int | float | None = None
+    benchmark_metadata: dict[str, Any] = field(default_factory=dict)
+    extra: Any = field(default_factory=dict)
+    gpu_telemetry: dict[str, Any] | None = None
 
 
-def tasks_for_manual(indices: list[str], rows: list[dict]) -> list[Task]:
-    """Rows of the QOBLIB table; ``IDX`` uses the default λ, ``IDX:R`` uses RISKS[R]."""
-    tasks = []
-    for item in indices:
-        idx, _, risk = item.partition(":")
-        row = rows[int(idx)]
-        tasks.append(make_task(row["Instance"], "orig", RISKS[int(risk)] if risk else RISKS[DEFAULT_RISK]))
-    return tasks
+# ---------------------------------------------------------------------------
+# CSV Benchmark & Submission Best-Known Loading
+# ---------------------------------------------------------------------------
 
 
-# ── best known (CSV, then QOBLIB's curated reference) ──────────────────────────────────
-
-_BKV: dict[str, dict] = {}
-
-
-def _qt():
-    if str(REPO) not in sys.path:
-        sys.path.insert(0, str(REPO))
-    import qoblib_tools as qt
-
-    return qt
-
-
-def _local_model(task: Task):
-    """Official model for ``task``, reading instances/<base>/ like qt.load_portfolio_instance."""
-    qt = _qt()
-    folder = INSTANCES_DIR / task.base
-    if not folder.is_dir():
-        return qt.PortfolioModel(qt.load_portfolio_instance(task.base), budget=task.budget, lam=task.lam)
-    symbols, index, entries = [], {}, []
-    for day, sym, price in qt._data_rows(folder / "stock_prices.txt.gz"):
-        if sym not in index:
-            index[sym] = len(symbols)
-            symbols.append(sym)
-        entries.append((index[sym], int(day), Fraction(price)))
-    n_periods = max(t for _, t, _ in entries) + 1
-    prices = [[None] * n_periods for _ in symbols]
-    for i, t, p in entries:
-        prices[i][t] = p
-    cov = {}
-    for day, s1, s2, value in qt._data_rows(folder / "covariance_matrices.txt.gz"):
-        if s1 in index and s2 in index and int(day) < n_periods:
-            cov[index[s1], index[s2], int(day)] = Fraction(value)
-    inst = qt.PortfolioInstance(task.base, symbols, n_periods, prices, cov)
-    return qt.PortfolioModel(inst, budget=task.budget, lam=task.lam)
-
-
-def best_known(task: Task, rows: list[dict]) -> dict:
-    if task.name in _BKV:
-        return _BKV[task.name]
-    row = next((r for r in rows if r["Instance"] == task.csv_instance), None)
-    out = {"value": None, "source": None, "optimal": None,
-           "csv_instance": row["Instance"] if row else None,
-           "csv_parameters": row["Parameters"] if row else None,
-           "csv_status": row["Status"] if row else None, "note": None}
-    if row:
-        found = dict(re.findall(r"(Assets|Periods|Budget) (\d+)", row["Parameters"]))
-        expected = {"Assets": str(task.assets), "Periods": str(task.days), "Budget": str(task.budget)}
-        if found != expected:
-            out["note"] = f"CSV Parameters {found} do not match the instance {expected}"
-        if row["Best objective"].strip():
-            value = float(row["Best objective"])
-            out.update(value=int(value) if value.is_integer() else value, source="csv",
-                       optimal=(row["Optimal"].strip() or None))
-    if out["value"] is None:  # the CSV column is empty: score QOBLIB's curated reference instead
-        try:
-            qt = _qt()
-            path = qt.fetch_portfolio_reference(task.base, budget=task.budget, lam_tag=task.lam)
-            _, positions = qt.read_portfolio_solution(path)
-            out.update(value=int(_local_model(task).score(positions).objective),
-                       source="qoblib_reference", optimal=".opt." in Path(path).name)
-        except Exception as err:  # a200/a400 have no published values
-            out["note"] = (out["note"] + "; " if out["note"] else "") + f"no best-known value ({type(err).__name__})"
-    _BKV[task.name] = out
-    return out
-
-
-# ── solution checker ───────────────────────────────────────────────────────────────────
-
-SCORE_RE = re.compile(r"Your score:\s*objective=(-?\d+)\s*\((feasible|INFEASIBLE)(?:;\s*(.*))?\)\s*$", re.M)
-VIOLATIONS_RE = re.compile(r"Constraint violations:\s*(\[.*\])", re.S)
-
-
-def run_checker(sol: Path) -> dict:
-    """``python solution_checker.py <sol>`` and its printout as a dict."""
-    try:
-        proc = subprocess.run([sys.executable, str(CHECKER), str(sol)], cwd=REPO, capture_output=True,
-                              text=True, encoding="utf-8", errors="replace", timeout=1800,
-                              env={**os.environ, "PYTHONIOENCODING": "utf-8"})
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "solution_checker.py timed out"}
-    out = {"ok": proc.returncode == 0, "returncode": proc.returncode, "objective": None, "feasible": None,
-           "breakdown": {}, "violations": None, "stdout": proc.stdout.strip(),
-           "stderr": proc.stderr.strip()[-2000:] or None}
-    m = SCORE_RE.search(proc.stdout)
-    if m:
-        out["objective"] = int(m.group(1))
-        out["feasible"] = m.group(2) == "feasible"
-        out["breakdown"] = {k: int(v) for k, v in re.findall(r"(\w+)=(-?\d+)", m.group(3) or "")}
-    v = VIOLATIONS_RE.search(proc.stdout)
-    if v:
-        try:
-            out["violations"] = ast.literal_eval(v.group(1).strip())
-        except (ValueError, SyntaxError):
-            out["violations"] = v.group(1).strip()
-    return out
-
-
-# ── helpers ────────────────────────────────────────────────────────────────────────────
-
-
-def now() -> str:
-    return dt.datetime.now().isoformat(timespec="seconds")
-
-
-def unique_path(path: Path) -> Path:
-    """``path``, or ``path_1``, ``path_2``, … if taken: never overwrite."""
-    if not path.exists():
-        return path
-    k = 1
-    while (cand := path.with_name(f"{path.stem}_{k}{path.suffix}")).exists():
-        k += 1
-    return cand
-
-
-def credit_status() -> dict | None:
-    try:
-        from divi.backends import QoroService
-
-        raw = QoroService().get_credit_balance()
-        return {"balance": float(raw["balance"]), "total_used": float(raw.get("total_used") or 0)}
-    except Exception as err:
-        print(f"[auto_runner] could not read the Qoro credit balance: {err}")
+def _parse_numeric(value: str | None) -> int | float | None:
+    if value is None:
         return None
-
-
-# ── one task's terminal (child mode) ───────────────────────────────────────────────────
-
-
-def child_main(spec_path: str) -> int:
-    """Runs inside the task's terminal: start the worker, tee its output, record the result."""
+    text = value.strip()
+    if not text or text.upper() == "N/A":
+        return None
     try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-    spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
-    start, code, result = now(), None, None
-    print(f"[auto_runner] {spec['name']}  started {start}\n[auto_runner] {shlex.join(spec['cmd'])}\n", flush=True)
-    try:
-        with open(spec["log"], "w", encoding="utf-8") as log:
-            env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8", **(spec.get("env") or {})}
-            proc = subprocess.Popen(spec["cmd"], cwd=spec["cwd"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, encoding="utf-8", errors="replace", env=env)
-            for line in proc.stdout:
-                log.write(line)
-                log.flush()
-                print(line, end="", flush=True)
-                if line.startswith(RESULT_MARKER.strip()):  # "AUTORUNNER_RESULT " or "AUTORUNNER_RESULT:"
-                    try:
-                        result = json.loads(line[len(RESULT_MARKER.strip()):].lstrip(": "))
-                    except json.JSONDecodeError:
-                        pass
-            code = proc.wait()
-    except Exception as err:
-        print(f"[auto_runner] could not run the worker: {err!r}", flush=True)
-        code = -1
-    finally:
-        tmp = Path(spec["done"] + ".tmp")
-        tmp.write_text(json.dumps({"exit_code": code, "start": start, "end": now(), "result": result}),
-                       encoding="utf-8")
-        os.replace(tmp, spec["done"])
-    print(f"\n[auto_runner] {spec['name']} finished (exit code {code})", flush=True)
-    if not spec.get("silent"):
-        time.sleep(3)
-    return 0
+        num = float(text)
+    except ValueError:
+        return None
+    if math.isnan(num) or math.isinf(num):
+        return None
+    if num.is_integer():
+        return int(num)
+    return num
 
 
-def open_terminal(cmd: list[str], cwd: Path):
-    """Start ``cmd`` in a new terminal window. Returns (process | None, process_tracks_task)."""
-    system = platform.system()
-    if system == "Windows":
-        return subprocess.Popen(cmd, cwd=cwd, creationflags=subprocess.CREATE_NEW_CONSOLE), True
-    if system == "Darwin":
-        script = f"cd {shlex.quote(str(cwd))} && {shlex.join(cmd)}".replace("\\", "\\\\").replace('"', '\\"')
-        return subprocess.Popen(["osascript", "-e", f'tell application "Terminal" to do script "{script}"']), False
-    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
-        for term, prefix, tracks in (("gnome-terminal", ["--wait", "--"], True), ("konsole", ["--nofork", "-e"], True),
-                                     ("xterm", ["-e"], True), ("x-terminal-emulator", ["-e"], False)):
-            if exe := shutil.which(term):
-                return subprocess.Popen([exe, *prefix, *cmd], cwd=cwd), tracks
-    return None, False  # no window system: caller falls back to silent
+def load_benchmark_csv(csv_path: Path = BENCHMARKS_CSV) -> list[CsvBenchmarkRow]:
+    """Read ``qoblib_instance_benchmarks.csv`` preserving exact row order."""
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Benchmark CSV not found: {csv_path}")
 
-
-def kill_tree(proc) -> None:
-    if proc is None:
-        return
-    try:
-        import psutil
-
-        parent = psutil.Process(proc.pid)
-        family = parent.children(recursive=True) + [parent]
-        for p in family:
-            p.terminate()
-        psutil.wait_procs(family, timeout=10)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-
-
-# ── scheduling ─────────────────────────────────────────────────────────────────────────
-
-
-@dataclass
-class Running:
-    task: Task
-    solver_seed: int
-    job_id: str
-    seed_cwd: Path
-    done_path: Path
-    proc: subprocess.Popen | None
-    tracks: bool
-    start: str
-    credits_used_before: float | None = None
-    overlapped: bool = False
-    gone_since: float | None = None
-
-
-@dataclass
-class Resources:
-    """How many tasks may run at once: local cores and memory, or cloud credits."""
-    cloud: bool
-    max_parallel: int | None
-    low_credits: float
-    slots: int = 1
-    mem_budget_mb: float = float("inf")
-    info: dict = field(default_factory=dict)
-
-    def assess(self) -> None:
-        if self.cloud:
-            status = credit_status()
-            self.info["credits_at_start"] = status
-            if status is None or status["balance"] < self.low_credits:
-                self.slots = 1
-                self.info["decision"] = (f"credits {status['balance'] if status else 'unknown'} < "
-                                         f"{self.low_credits}: one instance at a time")
+    rows: list[CsvBenchmarkRow] = []
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for idx, raw in enumerate(reader):
+            inst = (raw.get("Instance") or "").strip()
+            params = (raw.get("Parameters") or "").strip()
+            match = CSV_PARAMS_RE.search(params)
+            if match:
+                assets = int(match.group("assets"))
+                days = int(match.group("days"))
+                budget = int(match.group("budget"))
             else:
-                self.slots = self.max_parallel or 4
-                self.info["decision"] = f"credits {status['balance']}: up to {self.slots} instances in parallel"
-            return
-        try:
-            import psutil
+                spec_match = INSTANCE_SPEC_RE.match(inst)
+                if not spec_match:
+                    raise ValueError(
+                        f"Row {idx} in {csv_path.name} has unparseable Instance/Parameters: "
+                        f"{inst!r} / {params!r}"
+                    )
+                assets = int(spec_match.group("assets"))
+                days = int(spec_match.group("days"))
+                budget = (
+                    int(spec_match.group("budget"))
+                    if spec_match.group("budget")
+                    else BUDGET_BY_ASSETS[assets]
+                )
 
-            logical = psutil.cpu_count(logical=True) or os.cpu_count() or 2
-            avail_mb = psutil.virtual_memory().available / 2**20
-        except ImportError:
-            logical, avail_mb = os.cpu_count() or 2, float("inf")
-        cores = max(1, logical - 1)  # all cores but one
-        self.slots = max(1, cores // CORES_PER_TASK)
-        if self.max_parallel:
-            self.slots = min(self.slots, self.max_parallel)
-        self.mem_budget_mb = 0.8 * avail_mb
-        self.info.update(logical_cores=logical, cores_used=cores, cores_per_task=CORES_PER_TASK,
-                         available_mb=round(avail_mb), memory_budget_mb=round(self.mem_budget_mb),
-                         slots=self.slots,
-                         decision=f"{cores} cores / {CORES_PER_TASK} per task = {self.slots} parallel; "
-                                  "summed memory estimates ≤ 80% of free RAM")
-
-    def fits(self, task: Task, running: list[Running]) -> bool:
-        if not running:
-            return True
-        if len(running) >= self.slots:
-            return False
-        return self.cloud or sum(r.task.est_mb for r in running) + task.est_mb <= self.mem_budget_mb
-
-
-def worker_flags(worker: Path) -> dict[str, str]:
-    """Flag names this worker accepts (auto_worker.py style vs solver1.py style), read from its source."""
-    try:
-        src = worker.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        src = ""
-
-    def pick(*names: str) -> str:
-        return next((n for n in names if f'"{n}"' in src or f"'{n}'" in src), names[0])
-
-    return {"data": pick("--data-dir", "--instance-dir"),
-            "seed": pick("--seed", "--solver-seed"),
-            "lam": pick("--lam", "--lambda")}
+            rows.append(
+                CsvBenchmarkRow(
+                    index=idx,
+                    problem_id=(raw.get("Problem ID") or "").strip(),
+                    problem=(raw.get("Problem") or "").strip(),
+                    instance=inst,
+                    parameters=params,
+                    assets=assets,
+                    days=days,
+                    budget=budget,
+                    best_objective=_parse_numeric(raw.get("Best objective")),
+                    optimal=(raw.get("Optimal") or "").strip(),
+                    source=(raw.get("Source") or "").strip(),
+                    source_url=(raw.get("Source URL") or "").strip(),
+                    status=(raw.get("Status") or "").strip(),
+                    raw_url=(raw.get("Raw URL") or "").strip(),
+                )
+            )
+    return rows
 
 
-def run_test(test: str, tasks: list[Task], args, rows: list[dict]) -> Path | None:
-    worker = Path(args.worker).resolve()
-    flags = worker_flags(worker)
-    tasks = sorted(tasks, key=lambda t: t.n_vars, reverse=True)  # most complex first
-    solver_seeds: list[int] = list(args.solver_seeds)
-    multi_seed = len(solver_seeds) > 1
-    res = Resources(cloud=args.cloud, max_parallel=args.max_parallel, low_credits=args.low_credits)
-    res.assess()
+def lookup_best_known_score(
+    task: InstanceTask,
+    csv_by_instance: dict[str, CsvBenchmarkRow],
+) -> tuple[int | float | None, dict[str, Any]]:
+    """Extract the best known score from ``qoblib_instance_benchmarks.csv``.
 
-    print(f"\n=== {test}: {len(tasks)} instance(s) x {len(solver_seeds)} solver seed(s) {solver_seeds}, "
-          f"{'CLOUD' if args.cloud else 'local'}, {'silent' if args.silent else 'terminal windows'} ===\n"
-          f"    {res.info['decision']}")
-    for t in tasks:
-        data = "ok" if (INSTANCES_DIR / t.base).is_dir() else "MISSING"
-        print(f"  {t.name:32s} {t.n_vars:6d} vars  ~{t.subprograms:5d} sub-programs  ~{t.circuits:9,d} circuits  "
-              f"~{t.est_minutes:6.1f} min/run locally  ~{t.est_mb:5.0f} MB  data {data}")
-    if args.dry_run:
-        for t in tasks:
-            print(f"  best known {t.name}: {best_known(t, rows)}")
-        return None
-
-    AUTODATA.mkdir(exist_ok=True)
-    run_dir = unique_path(AUTODATA / f"{test}_{dt.datetime.now():%H%M}")
-    (run_dir / "_tasks").mkdir(parents=True)
-    print(f"    results: {run_dir}")
-
-    task_by_name = {t.name: t for t in tasks}
-    pending: list[tuple[Task, int]] = [(t, s) for t in tasks for s in solver_seeds]
-    running: list[Running] = []
-    seed_results: dict[str, dict[int, dict]] = {t.name: {} for t in tasks}
-    finished: dict[str, dict] = {}
-    silent, interrupted = args.silent, False
-    try:
-        while pending or running:
-            for r in list(running):
-                done_data = None
-                if r.done_path.exists():
-                    done_data = json.loads(r.done_path.read_text(encoding="utf-8"))
-                elif r.tracks and r.proc is not None and r.proc.poll() is not None:
-                    r.gone_since = r.gone_since or time.time()
-                    if time.time() - r.gone_since > 10:  # window closed before the task finished
-                        done_data = {"exit_code": None, "start": r.start, "end": now(),
-                                     "error": "terminal closed before the task finished"}
-                if done_data is not None:
-                    seed_results[r.task.name][r.solver_seed] = collect_seed(r, done_data, args, rows)
-                    running.remove(r)
-                    if len(seed_results[r.task.name]) == len(solver_seeds):
-                        finished[r.task.name] = finalize_instance(
-                            r.task, solver_seeds, seed_results[r.task.name], run_dir, rows
-                        )
-            while pending and res.fits(pending[0][0], running):
-                task, solver_seed = pending.pop(0)
-                job_id = f"{task.name}_seed{solver_seed}"
-                label = job_id if multi_seed else task.name
-                seed_cwd = run_dir / "_seeds" / job_id
-                seed_cwd.mkdir(parents=True, exist_ok=True)
-                done_path = run_dir / "_tasks" / f"{job_id}.done.json"
-                spec = {
-                    "name": label, "cwd": str(seed_cwd), "silent": silent,
-                    "log": str(run_dir / f"{label}.log"), "done": str(done_path),
-                    "env": {"AUTORUNNER_SOLVER_SEED": str(solver_seed)},
-                    "cmd": [sys.executable, str(worker),
-                            "--instance", task.name,
-                            flags["data"], os.path.relpath(INSTANCES_DIR / task.base, seed_cwd),
-                            "--assets", str(task.assets), "--days", str(task.days),
-                            flags["lam"], task.lam, "--budget", str(task.budget),
-                            "--cloud", "true" if args.cloud else "false",
-                            flags["seed"], str(solver_seed)],
-                }
-                spec_path = run_dir / "_tasks" / f"{job_id}.json"
-                spec_path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
-                child = [sys.executable, str(Path(__file__).resolve()), "--_child", str(spec_path)]
-                proc, tracks = (None, True) if silent else open_terminal(child, seed_cwd)
-                if proc is None:
-                    if not silent:
-                        print("[auto_runner] no terminal window available: continuing silently")
-                        silent = True
-                    proc = subprocess.Popen(child, cwd=seed_cwd, stdin=subprocess.DEVNULL,
-                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                before = (credit_status() or {}).get("total_used") if args.cloud else None
-                r = Running(task, solver_seed, job_id, seed_cwd, done_path, proc, tracks, now(),
-                            before, overlapped=bool(running))
-                for other in running:
-                    other.overlapped = True
-                running.append(r)
-                print(f"[{now()}] started  {label}  ({len(running)} running, {len(pending)} queued)")
-            time.sleep(2)
-    except KeyboardInterrupt:
-        interrupted = True
-        print(f"\n[auto_runner] Ctrl+C: stopping {len(running)} running job(s)")
-        for r in running:
-            kill_tree(r.proc)
-
-    for name, per_seed in seed_results.items():
-        if name not in finished and per_seed:
-            finished[name] = finalize_instance(task_by_name[name], solver_seeds, per_seed, run_dir, rows)
-
-    # Final JSON: TYPE_TIME.json, TIME = hour and minute when all outputs are done; never overwritten.
-    report = {
-        "test": test,
-        "instances": [t.name for t in tasks],
-        "settings": {"worker": str(worker), "local": not args.cloud, "silent": args.silent, "seed": args.seed,
-                     "solver_seeds": solver_seeds, "risk": RISKS[args.risk], "manual": args.manual,
-                     "python": sys.executable, "platform": platform.platform(), "interrupted": interrupted},
-        "results": {t.name: finished.get(t.name) for t in tasks},
-        "extra": {"resources": res.info},
+    Matches both the ``Instance`` and ``Parameters`` columns of the CSV.
+    When the CSV's ``Best objective`` column is blank (as in QOBLIB's base-level
+    table where each base spans 8 lambda values), falls back to scanning local
+    QOBLIB submission summary files under ``submissions/`` for the exact
+    ``(instance, budget, lambda)`` combination.
+    """
+    row = csv_by_instance.get(task.csv_instance_key)
+    metadata: dict[str, Any] = {
+        "csv_instance": task.csv_instance_key,
+        "csv_parameters": task.csv_parameters_key,
+        "csv_matched": row is not None,
     }
-    if args.cloud:
-        end = credit_status()
-        start = res.info.get("credits_at_start")
-        report["extra"]["credits_used_total"] = end["total_used"] - start["total_used"] if end and start else None
-    json_path = unique_path(run_dir / f"{test}_{dt.datetime.now():%H%M}.json")
-    json_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-    print_summary(report)
-    print(f"\nwrote {json_path}")
-    return json_path
+
+    if row is not None:
+        metadata["csv_parameters_match"] = row.parameters == task.csv_parameters_key
+        metadata["csv_status"] = row.status or None
+        metadata["csv_optimal"] = row.optimal or None
+        metadata["csv_source"] = row.source or None
+        metadata["csv_raw_url"] = row.raw_url or None
+        if row.best_objective is not None:
+            metadata["score_source"] = BENCHMARKS_CSV.name
+            return row.best_objective, metadata
+
+    # Fallback: check local QOBLIB submission summaries for this exact lambda
+    if SUBMISSIONS_DIR.exists():
+        best_val: int | float | None = None
+        best_source: str | None = None
+        is_proven_optimal = False
+        pattern = f"{task.full_name}_summary.csv"
+        for summary_path in sorted(SUBMISSIONS_DIR.rglob(pattern)):
+            try:
+                with summary_path.open("r", encoding="utf-8-sig", newline="") as fh:
+                    for srow in csv.DictReader(fh):
+                        obj = _parse_numeric(srow.get("Best Objective Value"))
+                        bound = _parse_numeric(srow.get("Optimality Bound"))
+                        if obj is None:
+                            continue
+                        # QOBLIB portfolio objective is minimization (lower is better).
+                        if best_val is None or obj < best_val:
+                            best_val = obj
+                            # Submission folder name is 2 levels up from instance folder
+                            rel_sub = summary_path.relative_to(SUBMISSIONS_DIR).parts[0]
+                            best_source = f"submissions/{rel_sub}"
+                            if bound is not None and abs(float(obj) - float(bound)) < 1e-6:
+                                is_proven_optimal = True
+            except OSError:
+                continue
+
+        if best_val is not None:
+            metadata["score_source"] = best_source
+            metadata["proven_optimal"] = is_proven_optimal
+            return best_val, metadata
+
+    metadata["score_source"] = None
+    return None, metadata
 
 
-def _seed_rank(rec: dict) -> tuple:
-    """Sort key for picking the best solver seed (lower tuple is better)."""
-    sol_path = rec.get("_sol_path")
-    has_sol = sol_path is not None and Path(sol_path).exists()
-    chk = rec.get("checker") or {}
-    feasible = chk.get("feasible") is True
-    obj = chk.get("objective")
-    if obj is None:
-        obj = rec.get("score")
-    has_obj = obj is not None
-    return (
-        0 if (feasible and has_sol) else 1,
-        0 if has_sol else 1,
-        0 if has_obj else 1,
-        obj if has_obj else float("inf"),
+# ---------------------------------------------------------------------------
+# Seed, Risk Lambda, and Instance Spec Resolution
+# ---------------------------------------------------------------------------
+
+
+def normalize_seed(seed: str) -> str:
+    """Normalize user seed strings such as ``orig``, ``s01``, or ``01``."""
+    s = seed.strip().lower()
+    if s == "orig":
+        return "orig"
+    if re.fullmatch(r"\d{2}", s):
+        s = f"s{s}"
+    if s not in VALID_SEEDS:
+        raise ValueError(
+            f"Invalid seed {seed!r}. Expected one of: {', '.join(VALID_SEEDS)} "
+            "(or two-digit suffix like '00', '01', '02')."
+        )
+    return s
+
+
+def risk_from_index(risk_index: int) -> tuple[float, str]:
+    """Return ``(lambda_float, lambda_tag)`` for a risk index in ``0..7``."""
+    if not 0 <= risk_index < len(RISK_LAMBDAS):
+        choices = ", ".join(f"{i}={t}" for i, t in enumerate(RISK_LAMBDA_TAGS))
+        raise ValueError(f"Risk index {risk_index} out of range 0..7 ({choices}).")
+    return RISK_LAMBDAS[risk_index], RISK_LAMBDA_TAGS[risk_index]
+
+
+def normalize_lambda(raw_lam: str) -> tuple[float, str]:
+    """Parse a lambda string (e.g. ``1e-05``, ``0``, ``1e-4``) to canonical form."""
+    val = float(raw_lam)
+    for grid_val, grid_tag in zip(RISK_LAMBDAS, RISK_LAMBDA_TAGS):
+        if math.isclose(val, grid_val, rel_tol=1e-9, abs_tol=1e-12):
+            return grid_val, grid_tag
+    if val == 0.0:
+        return 0.0, "0"
+    tag = format(val, "g").replace("e-0", "e-").replace("e+0", "e+")
+    return val, tag
+
+
+def parse_instance_spec(
+    spec: str,
+    *,
+    default_seed: str,
+    default_lam: float,
+    default_lam_tag: str,
+) -> InstanceTask:
+    """Parse an instance string from a test suite or CSV into an ``InstanceTask``."""
+    match = INSTANCE_SPEC_RE.match(spec.strip())
+    if not match:
+        raise ValueError(f"Unrecognized instance specification: {spec!r}")
+
+    assets = int(match.group("assets"))
+    days = int(match.group("days"))
+    raw_seed = match.group("seed")
+    seed = default_seed if raw_seed == "XX" else normalize_seed(raw_seed)
+
+    budget_str = match.group("budget")
+    if budget_str is not None:
+        budget = int(budget_str)
+    elif assets in BUDGET_BY_ASSETS:
+        budget = BUDGET_BY_ASSETS[assets]
+    else:
+        raise ValueError(f"Cannot infer budget for asset count {assets} in {spec!r}")
+
+    lam_str = match.group("lam")
+    if lam_str is not None:
+        lam, lam_tag = normalize_lambda(lam_str)
+    else:
+        lam, lam_tag = default_lam, default_lam_tag
+
+    task = InstanceTask(
+        assets=assets,
+        days=days,
+        seed=seed,
+        budget=budget,
+        lam=lam,
+        lam_tag=lam_tag,
+        raw_spec=spec,
+    )
+    if not task.instance_dir.is_dir():
+        raise FileNotFoundError(
+            f"Physical instance directory not found for {task.full_name}: {task.instance_dir}"
+        )
+    return task
+
+
+def resolve_test_suite_name(test_arg: str) -> str:
+    """Resolve either an integer index or a suite name to its canonical name."""
+    raw = test_arg.strip()
+    if raw.isdigit():
+        idx = int(raw)
+        if not 0 <= idx < len(TEST_SUITE_NAMES):
+            listing = ", ".join(f"{i}={n}" for i, n in enumerate(TEST_SUITE_NAMES))
+            raise ValueError(f"Test index {idx} out of range ({listing}).")
+        return TEST_SUITE_NAMES[idx]
+
+    lower_map = {name.lower(): name for name in TEST_SUITE_NAMES}
+    lower_map["test_all"] = "all"
+    lower_map["test all"] = "all"
+    if raw.lower() in lower_map:
+        return lower_map[raw.lower()]
+
+    raise ValueError(
+        f"Unknown test suite {test_arg!r}. Valid choices (by name or index 0..{len(TEST_SUITE_NAMES) - 1}): "
+        + ", ".join(f"{i}:{n}" for i, n in enumerate(TEST_SUITE_NAMES))
     )
 
 
-def collect_seed(r: Running, done: dict, args, rows: list[dict]) -> dict:
-    """Collect the result of one (instance, solver_seed) run."""
-    task, result = r.task, done.get("result")
-    if result is None and (path := r.seed_cwd / f"{task.name}.result.json").exists():
-        try:
-            result = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            result = None
-    block = {
-        "solver_seed": r.solver_seed,
-        "start": done.get("start", r.start),
-        "end": done.get("end"),
-        "exit_code": done.get("exit_code"),
+def parse_manual_indices(raw_tokens: list[str], total_rows: int) -> list[int]:
+    """Parse space- and/or comma-separated manual CSV row indices."""
+    indices: list[int] = []
+    for token in raw_tokens:
+        for part in token.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if not re.fullmatch(r"\d+", part):
+                raise ValueError(f"Manual index must be a non-negative integer, got {part!r}.")
+            idx = int(part)
+            if not 0 <= idx < total_rows:
+                raise ValueError(
+                    f"Manual index {idx} out of range for {BENCHMARKS_CSV.name} "
+                    f"(valid indices: 0..{total_rows - 1})."
+                )
+            indices.append(idx)
+    if not indices:
+        raise ValueError("Manual selection requires at least one instance index.")
+    return indices
+
+
+def parse_solver_seeds(raw_tokens: list[str] | None) -> list[int] | None:
+    """Parse solver RNG seed(s) for multi-seed optimization (e.g. ``1 2 3``).
+
+    Returns ``None`` if ``--solver-seeds`` was omitted, ``[1, 2, 3]`` if passed
+    with no values, or a deduplicated list of non-negative integers otherwise.
+    """
+    if raw_tokens is None:
+        return None
+    if len(raw_tokens) == 0:
+        return list(DEFAULT_SOLVER_SEEDS)
+
+    seeds: list[int] = []
+    seen: set[int] = set()
+    for token in raw_tokens:
+        for part in token.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if not re.fullmatch(r"\d+", part):
+                raise ValueError(
+                    f"Solver RNG seed must be a non-negative integer, got {part!r}."
+                )
+            seed_val = int(part)
+            if seed_val not in seen:
+                seen.add(seed_val)
+                seeds.append(seed_val)
+    if not seeds:
+        raise ValueError("Expected at least one integer solver RNG seed.")
+    return seeds
+
+
+def _expand_tasks_with_solver_seeds(
+    base_tasks: list[InstanceTask],
+    solver_seeds: list[int] | None,
+) -> list[InstanceTask]:
+    if solver_seeds is None:
+        return base_tasks
+    return [replace(task, solver_seed=s) for task in base_tasks for s in solver_seeds]
+
+
+def build_task_stack(
+    *,
+    csv_rows: list[CsvBenchmarkRow],
+    manual_tokens: list[str] | None,
+    test_arg: str | None,
+    seed_arg: str,
+    risk_index: int,
+    solver_seeds: list[int] | None = None,
+    instance_specs: list[str] | None = None,
+) -> tuple[str, list[InstanceTask], dict[str, Any]]:
+    """Build the ordered task stack according to CLI selection rules."""
+    if instance_specs:
+        if manual_tokens is not None or test_arg is not None:
+            raise ValueError("--instance cannot be combined with --manual or --tests")
+        lam, lam_tag = risk_from_index(risk_index)
+        seed = normalize_seed(seed_arg)
+        tasks_by_name = {}
+        for spec in instance_specs:
+            task = parse_instance_spec(
+                spec, default_seed=seed, default_lam=lam, default_lam_tag=lam_tag,
+            )
+            tasks_by_name.setdefault(task.full_name, task)
+        return "instances", _expand_tasks_with_solver_seeds(list(tasks_by_name.values()), solver_seeds), {
+            "mode": "instances",
+            "instance_specs": instance_specs,
+            "seed_used": seed,
+            "risk_index_used": risk_index,
+            "risk_lambda_used": lam,
+            "solver_seeds": solver_seeds,
+        }
+
+    if manual_tokens is not None:
+        # Manual selection overwrites tests, seed, and risk parameters.
+        indices = parse_manual_indices(manual_tokens, len(csv_rows))
+        default_lam, default_lam_tag = risk_from_index(DEFAULT_RISK_INDEX)
+        base_tasks = [
+            parse_instance_spec(
+                csv_rows[i].instance,
+                default_seed=DEFAULT_SEED,
+                default_lam=default_lam,
+                default_lam_tag=default_lam_tag,
+            )
+            for i in indices
+        ]
+        tasks = _expand_tasks_with_solver_seeds(base_tasks, solver_seeds)
+        meta = {
+            "mode": "manual",
+            "manual_indices": indices,
+            "seed_used": None,
+            "risk_index_used": DEFAULT_RISK_INDEX,
+            "risk_lambda_used": default_lam,
+            "solver_seeds": solver_seeds,
+        }
+        return "manual", tasks, meta
+
+    if test_arg is None:
+        raise ValueError("Specify --tests <name|index>, --manual <indices...>, or --instance <spec>.")
+
+    suite_name = resolve_test_suite_name(test_arg)
+    lam, lam_tag = risk_from_index(risk_index)
+    seed = normalize_seed(seed_arg)
+
+    if suite_name == "all":
+        # "test all" uses each CSV row's own seed (ignores --seed)
+        base_tasks = [
+            parse_instance_spec(
+                row.instance,
+                default_seed=DEFAULT_SEED,
+                default_lam=lam,
+                default_lam_tag=lam_tag,
+            )
+            for row in csv_rows
+        ]
+        tasks = _expand_tasks_with_solver_seeds(base_tasks, solver_seeds)
+        meta = {
+            "mode": "suite",
+            "suite_name": suite_name,
+            "seed_used": None,
+            "risk_index_used": risk_index,
+            "risk_lambda_used": lam,
+            "solver_seeds": solver_seeds,
+        }
+        return suite_name, tasks, meta
+
+    specs = TEST_SUITES_MAP[suite_name]
+    # CompareToOptimal explicitly overwrites the Seed parameter (all specs carry fixed seeds).
+    base_tasks = [
+        parse_instance_spec(
+            spec,
+            default_seed=seed,
+            default_lam=lam,
+            default_lam_tag=lam_tag,
+        )
+        for spec in specs
+    ]
+    tasks = _expand_tasks_with_solver_seeds(base_tasks, solver_seeds)
+    meta = {
+        "mode": "suite",
+        "suite_name": suite_name,
+        "seed_used": None if suite_name == "CompareToOptimal" else seed,
+        "risk_index_used": risk_index,
+        "risk_lambda_used": lam,
+        "solver_seeds": solver_seeds,
     }
-    if args.cloud:
-        after = (credit_status() or {}).get("total_used")
-        block["credits_used"] = ({"value": after - r.credits_used_before, "approximate": r.overlapped}
-                                 if after is not None and r.credits_used_before is not None else None)
-    best_sol = (result or {}).get("best_sol") or f"{task.name}.sol"
-    sol_path = r.seed_cwd / best_sol
-    block["_sol_path"] = str(sol_path) if sol_path.exists() else None
-    block["_seed_cwd"] = str(r.seed_cwd)
-    block["score"] = (result or {}).get("score")
-    block["checker"] = run_checker(sol_path) if sol_path.exists() else None
-    bkv = best_known(task, rows)["value"]
-    objective = (block["checker"] or {}).get("objective")
-    if objective is None:
-        objective = block["score"]
-    block["gap"] = (objective - bkv) / abs(bkv) if objective is not None and bkv not in (None, 0) else None
-    if done.get("error") or (result is None and done.get("exit_code") != 0):
-        block["error"] = done.get("error") or f"worker exit code {done.get('exit_code')}, no result reported"
-    block["extra"] = (result or {}).get("extra")
-    gap = "" if block["gap"] is None else f"  gap {block['gap']:+.2%}"
-    print(f"[{now()}] finished {task.name} (seed {r.solver_seed}): score {block['score']}, best known {bkv}{gap}")
-    return block
+    return suite_name, tasks, meta
 
 
-def finalize_instance(task: Task, solver_seeds: list[int], per_seed: dict[int, dict],
-                      run_dir: Path, rows: list[dict]) -> dict:
-    """Keep only the best .sol file across solver seeds, while preserving scores for all seeds."""
-    ordered = [(s, per_seed[s]) for s in solver_seeds if s in per_seed]
-    best_seed, best_rec = min(ordered, key=lambda item: _seed_rank(item[1]))
-
-    final_sol_name = f"{task.name}.sol"
-    final_sol_path = run_dir / final_sol_name
-    win_sol = best_rec.get("_sol_path")
-    if win_sol and Path(win_sol).exists():
-        shutil.copy2(win_sol, final_sol_path)
-
-    # Remove all per-seed .sol files so only the best solution file is saved.
-    for _, rec in ordered:
-        seed_cwd = rec.pop("_seed_cwd", None)
-        rec.pop("_sol_path", None)
-        if seed_cwd:
-            for sol_file in Path(seed_cwd).glob("*.sol"):
-                sol_file.unlink(missing_ok=True)
-
-    scores_by_seed = {}
-    solver_seed_records = {}
-    for s, rec in ordered:
-        score_val = rec.get("score")
-        if score_val is None:
-            score_val = (rec.get("checker") or {}).get("objective")
-        scores_by_seed[str(s)] = score_val
-        solver_seed_records[str(s)] = rec
-
-    block = {
-        "start": best_rec.get("start"),
-        "end": best_rec.get("end"),
-        "exit_code": best_rec.get("exit_code"),
-        "best_solver_seed": best_seed,
-        "best_sol": final_sol_name if final_sol_path.exists() else None,
-        "score": best_rec.get("score"),
-        "scores_by_seed": scores_by_seed,
-        "checker": best_rec.get("checker"),
-        "best_known": best_known(task, rows),
-        "gap": best_rec.get("gap"),
-        "solver_seeds": solver_seed_records,
-        "extra": best_rec.get("extra"),
-    }
-    if "credits_used" in best_rec:
-        block["credits_used"] = best_rec["credits_used"]
-    if "error" in best_rec:
-        block["error"] = best_rec["error"]
-    if len(ordered) > 1:
-        print(f"[{now()}] best for {task.name}: seed {best_seed} (score {block['score']}), "
-              f"all seeds: {scores_by_seed}")
-    return block
+# ---------------------------------------------------------------------------
+# Resource Estimation (Local) & Credit Checking (Cloud)
+# ---------------------------------------------------------------------------
 
 
-def print_summary(report: dict) -> None:
-    multi_seed = len(report.get("settings", {}).get("solver_seeds") or []) > 1
-    if multi_seed:
-        print(f"\n{'instance':34s} {'best_seed':>9s} {'score':>11s} {'checker':>11s} {'best known':>11s} {'gap':>9s}  feasible")
+def estimate_local_task_resources(task: InstanceTask) -> tuple[float, int]:
+    """Heuristically estimate ``(ram_gb, cpu_cores)`` occupied by one local task.
+
+    Calibrated from notebook 01:
+      - ``po_a010_t10`` has 710 QUBO variables (~70 sub-programs, runs in <1 min
+        locally with modest memory ~0.5 GB).
+      - Larger instances scale quadratically in asset count for dense risk
+        tensors (``T * N^2``) and linearly in ``n_vars = T * (6*N + 11)``.
+    """
+    n_vars = task.estimated_qubo_vars
+    risk_matrix_gb = (task.days * task.assets * task.assets * 8) / (1024**3)
+    # Base Python + Divi + Maestro simulator + QUBO & sub-program memory
+    est_ram_gb = 0.35 + (n_vars / 1000.0) * 0.16 + risk_matrix_gb * 8.0
+    est_ram_gb = round(max(0.45, est_ram_gb), 2)
+
+    if task.assets <= 10:
+        est_cores = 2
+    elif task.assets <= 50:
+        est_cores = 2
+    elif task.assets <= 200:
+        est_cores = 4
     else:
-        print(f"\n{'instance':34s} {'score':>11s} {'checker':>11s} {'best known':>11s} {'gap':>9s}  feasible")
-    for name, b in report["results"].items():
-        if not b:
-            print(f"{name:34s}  (not run)")
+        est_cores = 6
+
+    return est_ram_gb, est_cores
+
+
+def estimate_task_gpu_resources(
+    task: InstanceTask,
+    *,
+    vram_scale: float = 1.0,
+    util_scale: float = 1.0,
+) -> tuple[float, float]:
+    """Heuristically estimate ``(vram_gb, gpu_util_pct)`` for one task on a GPU.
+
+    Scales with QUBO variable count ``T * (6*N + 11)`` and dense risk tensor
+    footprint ``T * N^2``. Optional adaptive EMA scales refine estimates online
+    from observed GPU load during a run.
+    """
+    n_vars = task.estimated_qubo_vars
+    risk_tensor_gb = (task.days * task.assets * task.assets * 8) / (1024**3)
+    base_vram = 0.35 + (n_vars / 1000.0) * 0.14 + risk_tensor_gb * 6.0
+    est_vram_gb = round(max(0.40, base_vram * vram_scale), 2)
+
+    if task.assets <= 5:
+        base_util = 18.0
+    elif task.assets <= 10:
+        base_util = 24.0
+    elif task.assets <= 50:
+        base_util = 38.0
+    elif task.assets <= 200:
+        base_util = 58.0
+    else:
+        base_util = 74.0
+
+    day_factor = 1.0 + max(0, task.days - 10) * 0.02
+    est_util_pct = round(min(95.0, max(10.0, base_util * day_factor * util_scale)), 1)
+    return est_vram_gb, est_util_pct
+
+
+def _parse_float_safe(raw: str | None) -> float | None:
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text or text.upper() in ("N/A", "[N/A]", "[NOT SUPPORTED]", "NOT SUPPORTED"):
+        return None
+    try:
+        val = float(text)
+    except ValueError:
+        return None
+    if math.isnan(val) or math.isinf(val):
+        return None
+    return val
+
+
+def _query_nvidia_gpus(max_temp_c: float = GPU_MAX_TEMP_C_DEFAULT) -> list[GPUDeviceStatus]:
+    """Query NVIDIA GPUs via ``nvidia-smi`` (works on Linux & Windows)."""
+    if shutil.which("nvidia-smi") is None:
+        return []
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=index,name,memory.total,memory.free,memory.used,"
+        "utilization.gpu,temperature.gpu,power.draw,power.limit,"
+        "clocks_throttle_reasons.active",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return []
+
+    devices: list[GPUDeviceStatus] = []
+    for line in proc.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 7:
             continue
-        chk = b.get("checker") or {}
-        gap = "" if b.get("gap") is None else f"{b['gap']:+.2%}"
-        if multi_seed:
-            print(f"{name:34s} {str(b.get('best_solver_seed')):>9s} {str(b.get('score')):>11s} "
-                  f"{str(chk.get('objective')):>11s} {str(b['best_known']['value']):>11s} {gap:>9s}  {chk.get('feasible')}")
-            if b.get("scores_by_seed"):
-                per = ", ".join(f"{s}:{v}" for s, v in b["scores_by_seed"].items())
-                print(f"    all seeds: {per}")
+        try:
+            idx = int(parts[0])
+        except ValueError:
+            continue
+        name = parts[1]
+        total_mb = _parse_float_safe(parts[2]) or 0.0
+        free_mb = _parse_float_safe(parts[3]) or 0.0
+        used_mb = _parse_float_safe(parts[4]) or 0.0
+        util = _parse_float_safe(parts[5])
+        temp = _parse_float_safe(parts[6])
+        power_draw = _parse_float_safe(parts[7]) if len(parts) > 7 else None
+        power_limit = _parse_float_safe(parts[8]) if len(parts) > 8 else None
+        throttle_raw = parts[9] if len(parts) > 9 else ""
+
+        throttling = False
+        reasons: list[str] = []
+        if throttle_raw:
+            try:
+                mask = int(throttle_raw, 16)
+                if mask & _NV_THROTTLE_MASK:
+                    throttling = True
+                    reasons.append(f"nv_throttle_mask={throttle_raw}")
+            except ValueError:
+                pass
+        if temp is not None and temp >= max_temp_c:
+            throttling = True
+            reasons.append(f"temp={temp:.0f}C>={max_temp_c:.0f}C")
+        if power_draw is not None and power_limit and power_limit > 0:
+            if (power_draw / power_limit) >= 0.97:
+                throttling = True
+                reasons.append(f"power={power_draw:.0f}W/{power_limit:.0f}W")
+
+        devices.append(
+            GPUDeviceStatus(
+                index=idx,
+                name=name,
+                backend="cuda",
+                total_vram_gb=round(total_mb / 1024.0, 2),
+                free_vram_gb=round(free_mb / 1024.0, 2),
+                used_vram_gb=round(used_mb / 1024.0, 2),
+                utilization_pct=util,
+                temperature_c=temp,
+                power_draw_w=power_draw,
+                power_limit_w=power_limit,
+                throttling=throttling,
+                throttle_reason="; ".join(reasons) if reasons else None,
+                unified_memory=False,
+            )
+        )
+    return devices
+
+
+def _query_rocm_gpus(max_temp_c: float = GPU_MAX_TEMP_C_DEFAULT) -> list[GPUDeviceStatus]:
+    """Query AMD ROCm GPUs via ``rocm-smi``."""
+    if shutil.which("rocm-smi") is None:
+        return []
+    cmd = ["rocm-smi", "--showuse", "--showmeminfo", "vram", "--showtemp", "--json"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return []
+
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict):
+        return []
+
+    devices: list[GPUDeviceStatus] = []
+    for card_key, info in sorted(payload.items()):
+        if not isinstance(info, dict) or not card_key.lower().startswith("card"):
+            continue
+        m = re.search(r"(\d+)", card_key)
+        idx = int(m.group(1)) if m else len(devices)
+        total_b = _parse_float_safe(str(info.get("VRAM Total Memory (B)", ""))) or 0.0
+        used_b = _parse_float_safe(str(info.get("VRAM Total Used Memory (B)", ""))) or 0.0
+        util = _parse_float_safe(str(info.get("GPU use (%)", "")))
+        temp: float | None = None
+        for k, v in info.items():
+            if "temperature" in k.lower():
+                parsed_t = _parse_float_safe(str(v))
+                if parsed_t is not None:
+                    temp = parsed_t if temp is None else max(temp, parsed_t)
+        total_gb = total_b / (1024**3)
+        used_gb = used_b / (1024**3)
+        free_gb = max(0.0, total_gb - used_gb)
+        throttling = temp is not None and temp >= max_temp_c
+        devices.append(
+            GPUDeviceStatus(
+                index=idx,
+                name=str(info.get("Card series") or f"AMD ROCm {card_key}"),
+                backend="rocm",
+                total_vram_gb=round(total_gb, 2),
+                free_vram_gb=round(free_gb, 2),
+                used_vram_gb=round(used_gb, 2),
+                utilization_pct=util,
+                temperature_c=temp,
+                throttling=throttling,
+                throttle_reason=f"temp={temp:.0f}C>={max_temp_c:.0f}C" if throttling and temp else None,
+                unified_memory=False,
+            )
+        )
+    return devices
+
+
+def _query_apple_mps_gpu() -> list[GPUDeviceStatus]:
+    """Query Apple Silicon Metal/MPS GPU telemetry on macOS without sudo."""
+    if platform.system() != "Darwin":
+        return []
+
+    model_name: str | None = None
+    util_pct: float | None = None
+    used_bytes: float = 0.0
+    gpu_detected = False
+
+    # 1. Non-privileged IOKit accelerator telemetry (Device Utilization %, In use system memory)
+    if shutil.which("ioreg") is not None:
+        try:
+            proc = subprocess.run(
+                ["ioreg", "-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            out = proc.stdout
+            if proc.returncode == 0 and out:
+                m_model = re.search(r'"model"\s*=\s*"([^"]+)"', out)
+                if m_model:
+                    model_name = m_model.group(1)
+                    gpu_detected = True
+                m_util = re.search(r'"Device Utilization %"\s*=\s*(\d+)', out)
+                if not m_util:
+                    m_util = re.search(r'"Renderer Utilization %"\s*=\s*(\d+)', out)
+                if m_util:
+                    util_pct = float(m_util.group(1))
+                    gpu_detected = True
+                m_mem = re.search(r'"In use system memory"\s*=\s*(\d+)', out)
+                if not m_mem:
+                    m_mem = re.search(r'"Alloc system memory"\s*=\s*(\d+)', out)
+                if m_mem:
+                    used_bytes = float(m_mem.group(1))
+                    gpu_detected = True
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    # 2. Fallback check via sysctl Apple Silicon brand or torch.backends.mps
+    recommended_bytes: float | None = None
+    try:
+        import torch  # type: ignore import-not-found
+
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            gpu_detected = True
+            if hasattr(torch, "mps") and hasattr(torch.mps, "recommended_max_memory"):
+                recommended_bytes = float(torch.mps.recommended_max_memory())
+            if used_bytes == 0.0 and hasattr(torch, "mps") and hasattr(torch.mps, "current_allocated_memory"):
+                used_bytes = float(torch.mps.current_allocated_memory())
+    except Exception:
+        pass
+
+    if not gpu_detected and shutil.which("sysctl") is not None:
+        try:
+            proc = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            brand = proc.stdout.strip()
+            if proc.returncode == 0 and brand.startswith("Apple "):
+                model_name = f"{brand} GPU"
+                gpu_detected = True
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    if not gpu_detected:
+        return []
+
+    sys_res = get_system_resources()
+    total_sys_gb = float(sys_res["total_ram_gb"])
+    avail_sys_gb = float(sys_res["available_ram_gb"])
+
+    # Unified memory GPU budget: recommended Metal working set (~67% of unified RAM)
+    total_vram_gb = (
+        recommended_bytes / (1024**3)
+        if recommended_bytes and recommended_bytes > 0
+        else round(total_sys_gb * 0.67, 2)
+    )
+    used_vram_gb = used_bytes / (1024**3)
+    free_vram_gb = max(0.0, min(total_vram_gb - used_vram_gb, avail_sys_gb))
+
+    # Non-privileged macOS thermal pressure check via pmset
+    throttling = False
+    reasons: list[str] = []
+    if shutil.which("pmset") is not None:
+        try:
+            proc = subprocess.run(
+                ["pmset", "-g", "therm"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            therm_out = proc.stdout
+            m_speed = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", therm_out)
+            if m_speed and int(m_speed.group(1)) < 100:
+                throttling = True
+                reasons.append(f"CPU_Speed_Limit={m_speed.group(1)}%")
+            m_tlevel = re.search(r"Thermal_Level\s*=\s*(\d+)", therm_out)
+            if m_tlevel and int(m_tlevel.group(1)) > 0:
+                throttling = True
+                reasons.append(f"Thermal_Level={m_tlevel.group(1)}")
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    return [
+        GPUDeviceStatus(
+            index=0,
+            name=model_name or "Apple Silicon Metal GPU",
+            backend="mps",
+            total_vram_gb=round(total_vram_gb, 2),
+            free_vram_gb=round(free_vram_gb, 2),
+            used_vram_gb=round(used_vram_gb, 2),
+            utilization_pct=util_pct,
+            temperature_c=None,
+            throttling=throttling,
+            throttle_reason="; ".join(reasons) if reasons else None,
+            unified_memory=True,
+        )
+    ]
+
+
+def query_gpu_devices(max_temp_c: float = GPU_MAX_TEMP_C_DEFAULT) -> list[GPUDeviceStatus]:
+    """Discover and query live load/VRAM/thermal status of all local GPUs."""
+    nv = _query_nvidia_gpus(max_temp_c=max_temp_c)
+    if nv:
+        return nv
+    rocm = _query_rocm_gpus(max_temp_c=max_temp_c)
+    if rocm:
+        return rocm
+    return _query_apple_mps_gpu()
+
+
+def get_system_resources() -> dict[str, float | int]:
+    """Query available CPU cores and RAM (GB) in an OS-agnostic way."""
+    cpu_count = os.cpu_count() or 2
+    if psutil is not None:
+        vm = psutil.virtual_memory()
+        total_ram_gb = vm.total / (1024**3)
+        avail_ram_gb = vm.available / (1024**3)
+    else:  # pragma: no cover - fallback when psutil is missing
+        total_ram_gb = 8.0
+        avail_ram_gb = 4.0
+    return {
+        "cpu_count": cpu_count,
+        "total_ram_gb": round(total_ram_gb, 2),
+        "available_ram_gb": round(avail_ram_gb, 2),
+    }
+
+
+class PassiveGPUMonitor:
+    """Passive background GPU monitor for black-box anti-throttling & telemetry.
+
+    Polls local GPU telemetry on a background daemon thread without modifying
+    solver CLI flags or device environment variables. Uses live GPU load, free
+    VRAM, temperature, and throttle flags—combined with CPU/RAM headroom and
+    per-task resource estimates—to pace parallel launches so the system runs as
+    many tasks as possible without throttling.
+    """
+
+    def __init__(
+        self,
+        policy: GPUThrottlePolicy,
+        *,
+        gpu_query_fn=None,
+        sys_res_fn=None,
+        poll_interval_s: float = GPU_POLL_INTERVAL_S,
+        warmup_s: float = GPU_WARMUP_RESERVATION_S,
+        cooldown_s: float = GPU_THROTTLE_COOLDOWN_S,
+        clock_fn=time.monotonic,
+    ) -> None:
+        self.policy = policy
+        self._gpu_query_fn = gpu_query_fn or (
+            lambda: query_gpu_devices(max_temp_c=self.policy.max_temp_c)
+        )
+        self._sys_res_fn = sys_res_fn or get_system_resources
+        self._poll_interval_s = poll_interval_s
+        self._warmup_s = warmup_s
+        self._cooldown_s = cooldown_s
+        self._clock = clock_fn
+
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._active_jobs: list[ActiveJob] = []
+
+        self._last_poll_mono: float = -1e9
+        self._cached_gpus: list[GPUDeviceStatus] = []
+        self._gpu_cooldown_until: dict[int, float] = {}
+        self._throttle_logged: set[int] = set()
+        self.throttle_events: list[dict[str, Any]] = []
+
+    def start(self, active_jobs: list[ActiveJob]) -> None:
+        """Start passive background polling in a daemon thread."""
+        if not self.policy.enabled:
+            return
+        with self._lock:
+            self._active_jobs = active_jobs
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._background_loop,
+            name="autorunner-gpu-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the background polling thread cleanly."""
+        self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._thread = None
+
+    def _background_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.poll_gpus(force=True)
+                with self._lock:
+                    jobs = list(self._active_jobs)
+                self._observe_jobs(jobs)
+            except Exception:
+                pass
+            self._stop_event.wait(self._poll_interval_s)
+
+    def poll_gpus(self, *, force: bool = False) -> list[GPUDeviceStatus]:
+        if not self.policy.enabled:
+            return []
+        now = self._clock()
+        with self._lock:
+            if not force and (now - self._last_poll_mono) < self._poll_interval_s:
+                return list(self._cached_gpus)
+
+        gpus = self._gpu_query_fn()
+        cool_target = self.policy.max_temp_c - GPU_TEMP_HYSTERESIS_C
+
+        with self._lock:
+            self._cached_gpus = list(gpus)
+            self._last_poll_mono = now
+            for g in gpus:
+                is_hot = g.temperature_c is not None and g.temperature_c >= self.policy.max_temp_c
+                if g.throttling or is_hot:
+                    self._gpu_cooldown_until[g.index] = now + self._cooldown_s
+                    if g.index not in self._throttle_logged:
+                        self._throttle_logged.add(g.index)
+                        reason = g.throttle_reason or f"temp={g.temperature_c}C"
+                        print(
+                            f"[THROTTLE] GPU {g.index} ({g.name}) throttling ({reason}); "
+                            "pausing new parallel launches until cooled.",
+                            file=sys.stderr,
+                        )
+                        self.throttle_events.append(
+                            {
+                                "time": dt.datetime.now().isoformat(),
+                                "gpu_index": g.index,
+                                "gpu_name": g.name,
+                                "reason": reason,
+                                "temperature_c": g.temperature_c,
+                                "utilization_pct": g.utilization_pct,
+                            }
+                        )
+                else:
+                    if g.index in self._gpu_cooldown_until:
+                        temp_ok = g.temperature_c is None or g.temperature_c <= cool_target
+                        if now >= self._gpu_cooldown_until[g.index] and temp_ok:
+                            del self._gpu_cooldown_until[g.index]
+                            self._throttle_logged.discard(g.index)
+            return list(self._cached_gpus)
+
+    def is_gpu_cooling(self, gpu: GPUDeviceStatus) -> bool:
+        if gpu.throttling:
+            return True
+        if gpu.temperature_c is not None and gpu.temperature_c >= self.policy.max_temp_c:
+            return True
+        with self._lock:
+            until = self._gpu_cooldown_until.get(gpu.index)
+        if until is None:
+            return False
+        now = self._clock()
+        cool_target = self.policy.max_temp_c - GPU_TEMP_HYSTERESIS_C
+        temp_ok = gpu.temperature_c is None or gpu.temperature_c <= cool_target
+        return not (now >= until and temp_ok)
+
+    def _observe_jobs(self, jobs: list[ActiveJob]) -> None:
+        if not jobs:
+            return
+        with self._lock:
+            gpus = list(self._cached_gpus)
+        if not gpus:
+            return
+        max_util = max(
+            (g.utilization_pct for g in gpus if g.utilization_pct is not None),
+            default=None,
+        )
+        any_throttling = any(g.throttling or self.is_gpu_cooling(g) for g in gpus)
+        for job in jobs:
+            if max_util is not None:
+                if job.peak_gpu_util_pct is None or max_util > job.peak_gpu_util_pct:
+                    job.peak_gpu_util_pct = max_util
+            if any_throttling:
+                job.throttling_observed = True
+
+    def latest_snapshot(self) -> list[GPUDeviceStatus]:
+        with self._lock:
+            return list(self._cached_gpus)
+
+    def pick_next_task(
+        self,
+        pending: list[InstanceTask],
+        active: list[ActiveJob],
+        max_parallel: int,
+    ) -> int | None:
+        """Return index in ``pending`` safe to launch now, or ``None`` to wait."""
+        if not pending or len(active) >= max_parallel:
+            return None
+
+        sys_res = self._sys_res_fn()
+        sys_total_ram = float(sys_res["total_ram_gb"])
+        sys_avail_ram = float(sys_res["available_ram_gb"])
+        cpu_count = int(sys_res["cpu_count"])
+        usable_cores = max(1, cpu_count - 1)
+        now = self._clock()
+
+        gpus = self.poll_gpus()
+        any_cooling = any(self.is_gpu_cooling(g) for g in gpus)
+        if any_cooling:
+            # Pause new launches while any GPU is thermally/power throttling
+            return None
+
+        if not active:
+            # Never deadlock when idle and no GPU is throttling
+            return 0
+
+        active_cpu_cores = sum(estimate_local_task_resources(j.task)[1] for j in active)
+        warmup_ram = sum(
+            estimate_local_task_resources(j.task)[0]
+            for j in active
+            if (now - j.start_mono) < self._warmup_s
+        )
+        eff_avail_ram = max(0.0, sys_avail_ram - warmup_ram)
+        ram_reserve = sys_total_ram * 0.15
+
+        warmup_gpu_jobs = [j for j in active if (now - j.start_mono) < self._warmup_s]
+        warmup_vram = sum(estimate_task_gpu_resources(j.task)[0] for j in warmup_gpu_jobs)
+        warmup_util = sum(estimate_task_gpu_resources(j.task)[1] for j in warmup_gpu_jobs)
+
+        for idx, task in enumerate(pending):
+            est_ram, est_cores = estimate_local_task_resources(task)
+            cores_ok = (active_cpu_cores + est_cores) <= usable_cores
+            ram_ok = (eff_avail_ram - est_ram) >= ram_reserve
+
+            if active and not (cores_ok and ram_ok):
+                continue
+
+            if gpus:
+                est_vram, est_util = estimate_task_gpu_resources(task)
+                gpu_ok = False
+                for g in gpus:
+                    vram_reserve = g.total_vram_gb * (self.policy.vram_headroom_pct / 100.0)
+                    eff_free_vram = max(0.0, g.free_vram_gb - warmup_vram)
+                    if g.unified_memory:
+                        eff_free_vram = min(eff_free_vram, max(0.0, eff_avail_ram - ram_reserve))
+                        vram_reserve = 0.0
+                    live_util = g.utilization_pct if g.utilization_pct is not None else 0.0
+                    eff_util = min(100.0, live_util + warmup_util)
+
+                    vram_fits = (eff_free_vram - est_vram) >= vram_reserve
+                    util_fits = (eff_util + est_util) <= self.policy.max_util_pct
+                    if not active and live_util < self.policy.max_util_pct and eff_free_vram >= est_vram:
+                        vram_fits = True
+                        util_fits = True
+                    if vram_fits and util_fits:
+                        gpu_ok = True
+                        break
+                if not gpu_ok:
+                    continue
+
+            return idx
+
+        return None
+
+
+def calculate_local_concurrency(
+    tasks: list[InstanceTask],
+    *,
+    gpu_policy: GPUThrottlePolicy | None = None,
+    gpus: list[GPUDeviceStatus] | None = None,
+    max_workers_override: int | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Compute how many local tasks can safely run in parallel."""
+    policy = gpu_policy or GPUThrottlePolicy()
+    sys_res = get_system_resources()
+    cpu_count = int(sys_res["cpu_count"])
+    avail_ram_gb = float(sys_res["available_ram_gb"])
+
+    # Keep 20% RAM headroom and at least 1 CPU core for OS & runner
+    usable_ram_gb = max(0.5, avail_ram_gb * 0.80)
+    usable_cores = max(1, cpu_count - 1)
+
+    cpu_estimates = [estimate_local_task_resources(t) for t in tasks]
+    gpu_estimates = [estimate_task_gpu_resources(t) for t in tasks]
+
+    min_task_ram = min(ram for ram, _ in cpu_estimates)
+    min_task_cores = min(cores for _, cores in cpu_estimates)
+
+    ram_slots = max(1, int(usable_ram_gb // min_task_ram))
+    cpu_slots = max(1, int(usable_cores // min(min_task_cores, usable_cores)))
+    computed_max = max(1, min(len(tasks), ram_slots, cpu_slots))
+
+    detected_gpus = (
+        []
+        if not policy.enabled
+        else (gpus if gpus is not None else query_gpu_devices(max_temp_c=policy.max_temp_c))
+    )
+
+    if max_workers_override is not None:
+        final_max = max(1, min(len(tasks), max_workers_override))
+    else:
+        final_max = computed_max
+
+    report = {
+        "system": sys_res,
+        "usable_ram_gb": round(usable_ram_gb, 2),
+        "usable_cores": usable_cores,
+        "gpu_policy": policy.to_dict(),
+        "gpus": [g.to_dict() for g in detected_gpus],
+        "per_task_estimates": {
+            t.run_key: {
+                "instance": t.full_name,
+                "solver_seed": t.solver_seed,
+                "estimated_qubo_vars": t.estimated_qubo_vars,
+                "estimated_ram_gb": ram,
+                "estimated_cores": cores,
+                "estimated_vram_gb": vram,
+                "estimated_gpu_util_pct": gpu_util,
+            }
+            for t, (ram, cores), (vram, gpu_util) in zip(tasks, cpu_estimates, gpu_estimates)
+        },
+        "computed_max_parallel": computed_max,
+        "selected_max_parallel": final_max,
+    }
+    return final_max, report
+
+
+def _load_repo_dotenv() -> None:
+    """Load ``QORO_API_KEY`` from ``<REPO_ROOT>/.env`` if not already in env."""
+    if os.environ.get("QORO_API_KEY"):
+        return
+    env_file = REPO_ROOT / ".env"
+    if not env_file.is_file():
+        return
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
+def query_qoro_credits() -> tuple[float | None, dict[str, Any]]:
+    """Query Qoro cloud credit balance via ``divi.backends.QoroService``.
+
+    Returns ``(balance_float_or_None, info_dict)``.
+    """
+    _load_repo_dotenv()
+    try:
+        from divi.backends import QoroService  # type: ignore import-not-found
+
+        service = QoroService()
+        raw = service.get_credit_balance()
+        if isinstance(raw, dict):
+            balance = _parse_numeric(str(raw.get("balance")))
+            total_used = _parse_numeric(str(raw.get("total_used")))
+            return (
+                float(balance) if balance is not None else None,
+                {
+                    "available": True,
+                    "balance": float(balance) if balance is not None else None,
+                    "total_used": float(total_used) if total_used is not None else None,
+                    "raw": raw,
+                },
+            )
+        bal = _parse_numeric(str(raw))
+        return (
+            float(bal) if bal is not None else None,
+            {"available": True, "balance": float(bal) if bal is not None else None, "raw": raw},
+        )
+    except Exception as exc:
+        return None, {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def calculate_cloud_concurrency(
+    tasks: list[InstanceTask],
+    *,
+    low_credit_threshold: float = LOW_CREDIT_THRESHOLD_DEFAULT,
+    max_workers_override: int | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Check Qoro cloud credits and decide concurrency (1 at a time if low)."""
+    balance, credit_info = query_qoro_credits()
+
+    # Heuristic estimate of relative circuit load: ~70 sub-programs for 710 vars
+    est_subprograms = {
+        t.run_key: max(1, math.ceil(t.estimated_qubo_vars / 10)) for t in tasks
+    }
+
+    low_on_credits = balance is None or balance <= low_credit_threshold
+    if low_on_credits:
+        computed_max = 1
+        reason = (
+            "credit balance unavailable; defaulting to sequential execution"
+            if balance is None
+            else f"credit balance ({balance:.2f}) <= threshold ({low_credit_threshold:.2f}); "
+            "running one instance at a time"
+        )
+    else:
+        computed_max = max(1, min(len(tasks), CLOUD_MAX_PARALLEL_DEFAULT))
+        reason = (
+            f"credit balance ({balance:.2f}) > threshold ({low_credit_threshold:.2f}); "
+            f"running up to {computed_max} instances in parallel"
+        )
+
+    if max_workers_override is not None:
+        final_max = max(1, min(len(tasks), max_workers_override))
+    else:
+        final_max = computed_max
+
+    report = {
+        "credit_check": credit_info,
+        "low_credit_threshold": low_credit_threshold,
+        "low_on_credits": low_on_credits,
+        "estimated_subprograms": est_subprograms,
+        "reason": reason,
+        "computed_max_parallel": computed_max,
+        "selected_max_parallel": final_max,
+    }
+    return final_max, report
+
+
+# ---------------------------------------------------------------------------
+# Directory & Unique Filename Management
+# ---------------------------------------------------------------------------
+
+
+def create_run_directory(test_name: str, now: dt.datetime | None = None) -> Path:
+    """Create ``<REPO_ROOT>/AutoData/<test_name>_<HHMM>`` (unique if exists)."""
+    AUTODATA_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = (now or dt.datetime.now()).strftime("%H%M")
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", test_name).strip("_") or "run"
+    base = AUTODATA_DIR / f"{safe_name}_{stamp}"
+    candidate = base
+    counter = 1
+    while candidate.exists():
+        candidate = AUTODATA_DIR / f"{safe_name}_{stamp}_{counter}"
+        counter += 1
+    candidate.mkdir(parents=True, exist_ok=False)
+    return candidate
+
+
+def get_unique_json_path(run_dir: Path, test_name: str, finished_at: dt.datetime) -> Path:
+    """Return a non-overwriting path ``<TYPE>_<HHMM>[_<n>].json`` inside ``run_dir``."""
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", test_name).strip("_") or "run"
+    time_tag = finished_at.strftime("%H%M")
+    candidate = run_dir / f"{safe_name}_{time_tag}.json"
+    counter = 1
+    while candidate.exists():
+        candidate = run_dir / f"{safe_name}_{time_tag}_{counter}.json"
+        counter += 1
+    return candidate
+
+
+# ---------------------------------------------------------------------------
+# Solution Checker & Direct Output Parsing
+# ---------------------------------------------------------------------------
+
+
+def ensure_qoblib_data_cache(task: InstanceTask) -> None:
+    """Mirror local ``instances/<base>`` into ``qoblib_data/`` if missing.
+
+    ``solution_checker.py`` calls ``qoblib_tools.load_portfolio_instance``,
+    which looks in ``qoblib_data/06-portfolio/instances/<base>`` before falling
+    back to downloading from GitHub. Copying already-present local files ensures
+    ``solution_checker.py`` works instantaneously and offline.
+    """
+    src_dir = task.instance_dir
+    dst_dir = QOBLIB_DATA_INSTANCES_DIR / task.base_name
+    if not src_dir.is_dir():
+        return
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for fname in ("stock_prices.txt.gz", "covariance_matrices.txt.gz"):
+        src_file = src_dir / fname
+        dst_file = dst_dir / fname
+        if src_file.is_file() and not dst_file.exists():
+            shutil.copy2(src_file, dst_file)
+
+
+def find_solution_file(run_dir: Path, task: InstanceTask, existing_before: set[Path]) -> Path | None:
+    """Locate the ``.sol`` file generated for ``task`` inside ``run_dir``."""
+    lam_sci = f"{task.lam:.0e}" if task.lam != 0 else "0"
+    lam_dec = format(task.lam, "f").rstrip("0").rstrip(".") if task.lam != 0 else "0"
+
+    preferred_names = [
+        f"{task.full_name}.sol",
+        f"{task.full_name}_day_swap/{task.full_name}.sol",
+        f"{task.csv_instance_key}_l{task.lam_tag}.sol",
+        f"{task.base_name}_b{task.budget:03d}_l{lam_sci}.sol",
+        f"{task.csv_instance_key}_l{lam_sci}.sol",
+        f"{task.base_name}_b{task.budget:03d}_l{lam_dec}.sol",
+        f"{task.base_name}.sol",
+    ]
+    for name in preferred_names:
+        candidate = run_dir / name
+        if candidate.is_file():
+            return candidate
+
+    # Fallback: any newly created .sol file referencing this instance base
+    base_no_prefix = task.base_name.removeprefix("po_")
+    candidates = [
+        p
+        for p in run_dir.glob("*.sol")
+        if p not in existing_before and not p.name.endswith(".ckpt.sol")
+        and (base_no_prefix in p.name or task.base_name in p.name)
+    ]
+    if candidates:
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return candidates[0]
+    return None
+
+
+def parse_solution_checker_output(stdout: str, stderr: str, returncode: int) -> dict[str, Any]:
+    """Parse terminal output produced by ``solution_checker.py``.
+
+    Expected stdout lines from ``solution_checker.py``::
+
+        Your score:  objective=-69215 (feasible; risk=23400, return=-97784, ...)
+        Constraint violations:  []
+    """
+    result: dict[str, Any] = {
+        "returncode": returncode,
+        "objective": None,
+        "feasible": None,
+        "breakdown": {},
+        "violations": [],
+        "raw_stdout": stdout.strip(),
+    }
+    if stderr.strip():
+        result["raw_stderr"] = stderr.strip()
+
+    score_match = re.search(
+        r"Your score:\s*objective=(-?\d+)\s*\((feasible|INFEASIBLE);\s*([^)]*)\)",
+        stdout,
+    )
+    if score_match:
+        result["objective"] = int(score_match.group(1))
+        result["feasible"] = score_match.group(2) == "feasible"
+        breakdown: dict[str, int] = {}
+        for part in score_match.group(3).split(","):
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                try:
+                    breakdown[k.strip()] = int(v.strip())
+                except ValueError:
+                    pass
+        result["breakdown"] = breakdown
+
+    viol_match = re.search(r"Constraint violations:\s*(\[.*\])", stdout, re.DOTALL)
+    if viol_match:
+        raw_list = viol_match.group(1).splitlines()[0].strip()
+        try:
+            parsed_viol = ast.literal_eval(raw_list)
+            if isinstance(parsed_viol, list):
+                result["violations"] = [str(v) for v in parsed_viol]
+        except (SyntaxError, ValueError):
+            result["violations"] = [raw_list]
+
+    return result
+
+
+def run_solution_checker(sol_path: Path, task: InstanceTask) -> dict[str, Any]:
+    """Execute ``solution_checker.py <sol_path>`` and return parsed dictionary."""
+    ensure_qoblib_data_cache(task)
+    cmd = [sys.executable, str(SOLUTION_CHECKER), str(sol_path.resolve())]
+    proc = subprocess.run(
+        cmd,
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return parse_solution_checker_output(proc.stdout, proc.stderr, proc.returncode)
+
+
+def _extract_last_json_object(text: str) -> tuple[Any | None, str]:
+    """Extract the last JSON object/array from stdout text, returning ``(obj, remaining)``."""
+    stripped = text.strip()
+    if not stripped:
+        return None, ""
+
+    # 1. Explicit marker line: AUTORUNNER_RESULT: {...}
+    for line in reversed(stripped.splitlines()):
+        if "AUTORUNNER_RESULT:" in line:
+            payload = line.split("AUTORUNNER_RESULT:", 1)[1].strip()
+            try:
+                return json.loads(payload), stripped
+            except json.JSONDecodeError:
+                pass
+
+    # 2. Whole stdout is valid JSON
+    try:
+        obj = json.loads(stripped)
+        if isinstance(obj, (dict, list)):
+            return obj, ""
+    except json.JSONDecodeError:
+        pass
+
+    # 3. Scan backwards for a JSON object starting with '{'
+    decoder = json.JSONDecoder()
+    for idx in range(len(stripped) - 1, -1, -1):
+        if stripped[idx] == "{":
+            try:
+                obj, end = decoder.raw_decode(stripped, idx)
+                if stripped[end:].strip() == "":
+                    return obj, stripped[:idx].strip()
+            except json.JSONDecodeError:
+                continue
+
+    return None, stripped
+
+
+def parse_direct_task_output(stdout: str) -> tuple[int | float | None, Any]:
+    """Parse direct outputs (score + arbitrary JSON object) from task stdout."""
+    parsed_json, remaining = _extract_last_json_object(stdout)
+    reported_score: int | float | None = None
+    extra: Any = {}
+
+    if isinstance(parsed_json, dict):
+        for key in ("score", "best_score", "objective"):
+            if key in parsed_json and isinstance(parsed_json[key], (int, float)):
+                reported_score = parsed_json[key]
+                break
+        if "extra" in parsed_json:
+            extra = parsed_json["extra"]
         else:
-            print(f"{name:34s} {str(b.get('score')):>11s} {str(chk.get('objective')):>11s} "
-                  f"{str(b['best_known']['value']):>11s} {gap:>9s}  {chk.get('feasible')}")
+            extra = {k: v for k, v in parsed_json.items() if k not in ("score", "best_score")}
+    elif parsed_json is not None:
+        extra = parsed_json
+
+    if reported_score is None:
+        search_text = remaining or stdout
+        score_patterns = [
+            r"(?:best[_\s]*)?(?:score|objective)\s*[:=]\s*(-?\d+(?:\.\d+)?)",
+            r"^\s*(-?\d+(?:\.\d+)?)\s*$",
+        ]
+        for pat in score_patterns:
+            matches = re.findall(pat, search_text, flags=re.IGNORECASE | re.MULTILINE)
+            if matches:
+                reported_score = _parse_numeric(matches[-1])
+                break
+
+    return reported_score, extra
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# OS-Agnostic Terminal Launching & Worker Shim
+# ---------------------------------------------------------------------------
 
 
-def resolve_tests(items: list[str]) -> list[str]:
-    names = {n.lower(): n for n in TEST_NAMES}
-    out = []
-    for item in items:
-        if item.isdigit() and int(item) < len(TEST_NAMES):
-            out.append(TEST_NAMES[int(item)])
-        elif item.lower() in names:
-            out.append(names[item.lower()])
+def get_task_work_dir(run_dir: Path, task: InstanceTask, multi_seed: bool) -> Path:
+    """Return the execution working directory for ``task``.
+
+    When multiple solver RNG seeds run for the same instance, each seed runs in
+    an isolated ``seed_<N>/`` subdirectory inside ``run_dir`` so parallel tasks
+    cannot overwrite each other's ``<instance>.sol`` file.
+    """
+    if multi_seed and task.solver_seed is not None:
+        task_dir = run_dir / f"seed_{task.solver_seed}"
+        task_dir.mkdir(parents=True, exist_ok=True)
+        return task_dir
+    return run_dir
+
+
+def resolve_warm_start_args(
+    script_path: Path, task: InstanceTask, extra_args: list[str] | None,
+) -> list[str]:
+    """Resolve warm starts before workers change their working directory."""
+    out = list(extra_args or [])
+    if script_path.name not in WARM_START_SCRIPTS:
+        return out
+    for i, arg in enumerate(out):
+        if arg == "--init":
+            if i + 1 == len(out) or out[i + 1].startswith("--"):
+                raise ValueError("--init requires a .sol file or directory")
+            index, value = i + 1, out[i + 1]
+        elif arg.startswith("--init="):
+            index, value = i, arg.removeprefix("--init=")
         else:
-            raise SystemExit(f"unknown test {item!r}: use a name or index from --list")
+            continue
+        path = Path(value).expanduser().resolve()
+        if path.is_dir():
+            path /= f"{task.full_name}.sol"
+        if not path.is_file():
+            raise FileNotFoundError(f"Warm-start solution for {task.full_name} not found: {path}")
+        out[index] = f"--init={path}" if index == i else str(path)
+        return out
+    if script_path.name in DAY_SWAP_SCRIPTS:
+        raise ValueError(f"{script_path.name} requires --init after the runner's -- separator")
     return out
 
 
-def main(argv: list[str] | None = None) -> int:
-    argv = sys.argv[1:] if argv is None else argv
-    if argv[:1] == ["--_child"]:
-        return child_main(argv[1])
+def build_target_command(
+    script_path: Path,
+    task: InstanceTask,
+    task_cwd: Path,
+    local: bool,
+    extra_args: list[str] | None = None,
+) -> tuple[list[str], dict[str, str]]:
+    """Construct the command line and environment for executing one task."""
+    rel_instance_dir = os.path.relpath(task.instance_dir, task_cwd)
+    cloud_flag = "false" if local else "true"
 
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("worker", help="python file executed once per instance")
-    p.add_argument("--tests", nargs="+", metavar="TEST", help="test names or indices (see --list), or 'all'")
-    p.add_argument("--manual", nargs="+", metavar="ROW", help="rows of qoblib_instance_benchmarks.csv (see --list), "
-                   "optionally ROW:RISK; ignores --tests/--seed/--risk")
-    p.add_argument("--silent", action="store_true", help="no terminal windows")
-    p.add_argument("--seed", default="orig", choices=SEEDS, help="data seed for XX (default orig)")
-    p.add_argument("--solver-seeds", nargs="+", type=int, default=[DEFAULT_SOLVER_SEED], metavar="SEED",
-                   help=f"solver RNG seed(s) passed to worker via --seed (default: {DEFAULT_SOLVER_SEED})")
-    p.add_argument("--cloud", action="store_true", help="run on Qoro's cloud with credits (default: local)")
-    p.add_argument("--risk", type=int, default=DEFAULT_RISK, choices=range(len(RISKS)), metavar="0-7",
-                   help=f"λ index into {RISKS} (default {DEFAULT_RISK} = {RISKS[DEFAULT_RISK]})")
-    p.add_argument("--max-parallel", type=int, help="upper limit on instances running at once")
-    p.add_argument("--low-credits", type=float, default=100.0, help="cloud: below this balance run one at a time")
-    p.add_argument("--dry-run", action="store_true", help="show tasks, resource plan and best-known values only")
-    p.add_argument("--list", action="store_true", help="list tests, λ values and the CSV rows")
-    args = p.parse_args(argv)
-    args.solver_seeds = list(dict.fromkeys(args.solver_seeds))
-
-    rows = load_csv()
-    if args.list:
-        print("Tests (index: name):")
-        for i, name in enumerate(TEST_NAMES):
-            print(f"  {i}: {name:24s} {', '.join(TESTS[name])}")
-        print("\nRisk λ (--risk): " + ", ".join(f"{i}={r}" for i, r in enumerate(RISKS)))
-        print("\nQOBLIB table rows (--manual):")
-        for i, r in enumerate(rows):
-            print(f"  {i:2d}: {r['Instance']:22s} {r['Parameters']:38s} {r['Status']}")
-        return 0
-    if not Path(args.worker).is_file():
-        raise SystemExit(f"worker script {args.worker!r} not found")
-
-    if args.manual:
-        ignored = [flag for flag, used in (("--tests", args.tests), ("--seed", args.seed != "orig"),
-                                           ("--risk", args.risk != DEFAULT_RISK)) if used]
-        if ignored:
-            print(f"[auto_runner] --manual overrides {', '.join(ignored)}")
-        plan = [("manual", tasks_for_manual(args.manual, rows))]
-    elif args.tests:
-        if any(t.lower() == "all" for t in args.tests):  # every test, every seed
-            plan = [(t, tasks_for_test(t, SEEDS, RISKS[args.risk])) for t in TEST_NAMES]
+    solver_args = resolve_warm_start_args(script_path, task, extra_args)
+    cmd = [
+        sys.executable,
+        str(script_path.resolve()),
+        "--instance",
+        task.full_name,
+        "--instance-dir",
+        rel_instance_dir,
+        "--assets",
+        str(task.assets),
+        "--days",
+        str(task.days),
+        "--lambda",
+        task.lam_tag,
+        "--budget",
+        str(task.budget),
+        "--cloud",
+        cloud_flag,
+    ]
+    if task.solver_seed is not None:
+        cmd.extend(["--solver-seed", str(task.solver_seed)])
+    if script_path.name in DAY_SWAP_SCRIPTS:
+        # The standalone day-swap CLIs take a base name and use the referee cache.
+        cmd = [
+            sys.executable, str(script_path.resolve()), "--instance", task.base_name,
+            "--budget", str(task.budget), "--lam", task.lam_tag,
+        ]
+        if task.solver_seed is not None:
+            cmd.extend(["--seed", str(task.solver_seed)])
+        # Keep the detected final solution in the job directory and isolate
+        # the parallel workers' intermediate files by instance.
+        cmd.extend(solver_args)
+        if script_path.name == "day_swap_parallel.py":
+            cmd.extend(["--out", f"{task.full_name}_day_swap"])
         else:
-            plan = [(t, tasks_for_test(t, [args.seed], RISKS[args.risk])) for t in resolve_tests(args.tests)]
+            cmd.extend(["--out", ".", "--canonical-sol"])
     else:
-        raise SystemExit("choose instances with --tests or --manual (see --list)")
+        cmd.extend(solver_args)
 
-    for test, tasks in plan:
-        run_test(test, tasks, args, rows)
-    return 0
+    env = os.environ.copy()
+    existing_py_path = env.get("PYTHONPATH", "")
+    repo_str = str(REPO_ROOT)
+    if existing_py_path:
+        env["PYTHONPATH"] = f"{repo_str}{os.pathsep}{existing_py_path}"
+    else:
+        env["PYTHONPATH"] = repo_str
+
+    # Mirror parameters in environment variables for convenience
+    env["AUTORUNNER_INSTANCE"] = task.full_name
+    env["AUTORUNNER_INSTANCE_DIR"] = rel_instance_dir
+    env["AUTORUNNER_ASSETS"] = str(task.assets)
+    env["AUTORUNNER_DAYS"] = str(task.days)
+    env["AUTORUNNER_LAMBDA"] = task.lam_tag
+    env["AUTORUNNER_BUDGET"] = str(task.budget)
+    env["AUTORUNNER_CLOUD"] = cloud_flag
+    if task.solver_seed is not None:
+        env["AUTORUNNER_SOLVER_SEED"] = str(task.solver_seed)
+    return cmd, env
+
+
+def run_worker_shim(spec_path: Path) -> int:
+    """Internal entry point executed inside a visible OS terminal window.
+
+    Streams the target script's stdout/stderr live to the terminal while also
+    recording them to log files and writing a ``.done.json`` completion file so
+    the parent ``auto_runner.py`` process knows the exact timestamps, exit code,
+    and outputs across macOS, Linux, and Windows.
+    """
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    cmd: list[str] = spec["cmd"]
+    cwd: str = spec["cwd"]
+    env_updates: dict[str, str] = spec.get("env_updates", {})
+    stdout_log = Path(spec["stdout_log"])
+    stderr_log = Path(spec["stderr_log"])
+    done_file = Path(spec["done_file"])
+    pid_file = Path(spec["pid_file"])
+    instance_name: str = spec["instance_name"]
+
+    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+
+    print("=" * 72, flush=True)
+    print(f"[AutoRunner] Instance : {instance_name}", flush=True)
+    print(f"[AutoRunner] Workdir  : {cwd}", flush=True)
+    print(f"[AutoRunner] Command  : {' '.join(cmd)}", flush=True)
+    print("=" * 72, flush=True)
+
+    env = os.environ.copy()
+    env.update(env_updates)
+
+    start_dt = dt.datetime.now()
+    t0 = time.monotonic()
+
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+
+        # Read stdout & stderr concurrently via two lightweight threads
+        import threading
+
+        def _pump(stream, sink_list: list[str], target_io) -> None:
+            try:
+                for line in iter(stream.readline, ""):
+                    sink_list.append(line)
+                    target_io.write(line)
+                    target_io.flush()
+            finally:
+                stream.close()
+
+        t_out = threading.Thread(target=_pump, args=(proc.stdout, stdout_chunks, sys.stdout))
+        t_err = threading.Thread(target=_pump, args=(proc.stderr, stderr_chunks, sys.stderr))
+        t_out.start()
+        t_err.start()
+        returncode = proc.wait()
+        t_out.join()
+        t_err.join()
+    except Exception as exc:  # pragma: no cover
+        returncode = 1
+        err_msg = f"[AutoRunner Worker Error] {type(exc).__name__}: {exc}\n"
+        stderr_chunks.append(err_msg)
+        sys.stderr.write(err_msg)
+        sys.stderr.flush()
+
+    duration = time.monotonic() - t0
+    end_dt = dt.datetime.now()
+
+    stdout_log.write_text("".join(stdout_chunks), encoding="utf-8")
+    stderr_log.write_text("".join(stderr_chunks), encoding="utf-8")
+
+    done_payload = {
+        "returncode": returncode,
+        "start_time": start_dt.isoformat(),
+        "end_time": end_dt.isoformat(),
+        "duration_seconds": round(duration, 4),
+    }
+    tmp_done = done_file.with_suffix(".tmp")
+    tmp_done.write_text(json.dumps(done_payload), encoding="utf-8")
+    tmp_done.replace(done_file)
+
+    print("=" * 72, flush=True)
+    print(f"[AutoRunner] Finished {instance_name} (exit={returncode}, {duration:.2f}s)", flush=True)
+    print("=" * 72, flush=True)
+    return returncode
+
+
+@dataclass
+class ActiveJob:
+    """Tracks one in-flight task (either silent subprocess or visible terminal)."""
+
+    task: InstanceTask
+    run_dir: Path
+    task_cwd: Path
+    existing_sols_before: set[Path]
+    start_dt: dt.datetime
+    start_mono: float
+    credits_before: float | None
+    mode: str  # "silent" or "visible"
+    gpu_util_before_pct: float | None = None
+    gpu_vram_free_before_gb: float | None = None
+    peak_gpu_util_pct: float | None = None
+    throttling_observed: bool = False
+    popen: subprocess.Popen[str] | None = None
+    stdout_log: Path | None = None
+    stderr_log: Path | None = None
+    done_file: Path | None = None
+    pid_file: Path | None = None
+    launch_mono: float = field(default_factory=time.monotonic)
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if psutil is not None:
+        return psutil.pid_exists(pid)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _launch_visible_terminal(
+    spec_path: Path,
+    tmp_dir: Path,
+    task_name: str,
+) -> tuple[bool, subprocess.Popen[str] | None, str]:
+    """Attempt to launch ``auto_runner.py --_worker <spec_path>`` in a native OS terminal.
+
+    Returns ``(launched_ok, optional_popen, diagnostic_message)``.
+    """
+    system = platform.system()
+    shim_cmd = [sys.executable, str(Path(__file__).resolve()), "--_worker", str(spec_path)]
+
+    if system == "Windows":
+        create_new_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+        try:
+            proc = subprocess.Popen(shim_cmd, creationflags=create_new_console)
+            return True, proc, "Windows CREATE_NEW_CONSOLE"
+        except OSError as exc:
+            return False, None, f"Windows terminal launch failed: {exc}"
+
+    # POSIX helper script avoids nested shell/AppleScript quoting hazards
+    launcher_sh = tmp_dir / f"launch_{task_name}.sh"
+    quoted_cmd = " ".join(shlex.quote(arg) for arg in shim_cmd)
+    launcher_sh.write_text(f"#!/bin/sh\n{quoted_cmd}\n", encoding="utf-8")
+    launcher_sh.chmod(0o755)
+
+    if system == "Darwin":
+        if shutil.which("osascript") is None:
+            return False, None, "osascript not available"
+        applescript_cmd = f"sh {shlex.quote(str(launcher_sh))}"
+        escaped = applescript_cmd.replace("\\", "\\\\").replace('"', '\\"')
+        script = f'tell application "Terminal" to do script "{escaped}"'
+        res = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode == 0:
+            return True, None, "macOS Terminal.app"
+        return False, None, f"macOS Terminal launch failed: {res.stderr.strip()}"
+
+    # Linux / BSD desktop terminals
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False, None, "No DISPLAY/WAYLAND_DISPLAY set (headless Linux)"
+
+    linux_terminals: list[tuple[str, list[str]]] = [
+        ("x-terminal-emulator", ["-e", "sh", str(launcher_sh)]),
+        ("gnome-terminal", ["--", "sh", str(launcher_sh)]),
+        ("konsole", ["-e", "sh", str(launcher_sh)]),
+        ("xfce4-terminal", ["-e", f"sh {shlex.quote(str(launcher_sh))}"]),
+        ("alacritty", ["-e", "sh", str(launcher_sh)]),
+        ("kitty", ["sh", str(launcher_sh)]),
+        ("xterm", ["-e", "sh", str(launcher_sh)]),
+        ("mate-terminal", ["--", "sh", str(launcher_sh)]),
+        ("lxterminal", ["-e", f"sh {shlex.quote(str(launcher_sh))}"]),
+    ]
+    for binary, args in linux_terminals:
+        found = shutil.which(binary)
+        if found:
+            try:
+                proc = subprocess.Popen([found, *args])
+                return True, proc, f"Linux terminal ({binary})"
+            except OSError:
+                continue
+
+    return False, None, "No supported Linux terminal emulator found"
+
+
+def start_task_job(
+    *,
+    script_path: Path,
+    task: InstanceTask,
+    run_dir: Path,
+    task_cwd: Path,
+    tmp_dir: Path,
+    local: bool,
+    silent: bool,
+    track_credits: bool = False,
+    gpu_snapshots: list[GPUDeviceStatus] | None = None,
+    extra_args: list[str] | None = None,
+) -> ActiveJob:
+    """Start one instance task either silently or in a visible OS terminal."""
+    if script_path.name in DAY_SWAP_SCRIPTS:
+        ensure_qoblib_data_cache(task)
+    cmd, env = build_target_command(
+        script_path, task, task_cwd, local, extra_args=extra_args
+    )
+    existing_sols = set(task_cwd.glob("*.sol"))
+
+    credits_before: float | None = None
+    if not local and track_credits:
+        credits_before, _ = query_qoro_credits()
+
+    start_dt = dt.datetime.now()
+    start_mono = time.monotonic()
+
+    snaps = gpu_snapshots or []
+    gpu_util_before = max(
+        (g.utilization_pct for g in snaps if g.utilization_pct is not None),
+        default=None,
+    )
+    gpu_vram_before = (
+        round(sum(g.free_vram_gb for g in snaps), 2) if snaps else None
+    )
+
+    if not silent:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", task.run_key)
+        spec_path = tmp_dir / f"{safe}.spec.json"
+        stdout_log = tmp_dir / f"{safe}.stdout.log"
+        stderr_log = tmp_dir / f"{safe}.stderr.log"
+        done_file = tmp_dir / f"{safe}.done.json"
+        pid_file = tmp_dir / f"{safe}.pid"
+
+        env_updates = {
+            k: env[k]
+            for k in (
+                "PYTHONPATH",
+                "AUTORUNNER_INSTANCE",
+                "AUTORUNNER_INSTANCE_DIR",
+                "AUTORUNNER_ASSETS",
+                "AUTORUNNER_DAYS",
+                "AUTORUNNER_LAMBDA",
+                "AUTORUNNER_BUDGET",
+                "AUTORUNNER_CLOUD",
+                "AUTORUNNER_SOLVER_SEED",
+            )
+            if k in env
+        }
+        spec_path.write_text(
+            json.dumps(
+                {
+                    "instance_name": task.display_name,
+                    "cmd": cmd,
+                    "cwd": str(task_cwd),
+                    "env_updates": env_updates,
+                    "stdout_log": str(stdout_log),
+                    "stderr_log": str(stderr_log),
+                    "done_file": str(done_file),
+                    "pid_file": str(pid_file),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        launched, proc, diag = _launch_visible_terminal(spec_path, tmp_dir, safe)
+        if launched:
+            print(f"[LAUNCH] {task.display_name} in visible terminal ({diag})")
+            return ActiveJob(
+                task=task,
+                run_dir=run_dir,
+                task_cwd=task_cwd,
+                existing_sols_before=existing_sols,
+                start_dt=start_dt,
+                start_mono=start_mono,
+                credits_before=credits_before,
+                mode="visible",
+                gpu_util_before_pct=gpu_util_before,
+                gpu_vram_free_before_gb=gpu_vram_before,
+                peak_gpu_util_pct=gpu_util_before,
+                popen=proc,
+                stdout_log=stdout_log,
+                stderr_log=stderr_log,
+                done_file=done_file,
+                pid_file=pid_file,
+            )
+        print(
+            f"[WARN] Could not open visible terminal for {task.display_name} ({diag}); "
+            "falling back to silent execution.",
+            file=sys.stderr,
+        )
+
+    # Silent execution
+    print(f"[LAUNCH] {task.display_name} (silent)")
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(task_cwd),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return ActiveJob(
+        task=task,
+        run_dir=run_dir,
+        task_cwd=task_cwd,
+        existing_sols_before=existing_sols,
+        start_dt=start_dt,
+        start_mono=start_mono,
+        credits_before=credits_before,
+        mode="silent",
+        gpu_util_before_pct=gpu_util_before,
+        gpu_vram_free_before_gb=gpu_vram_before,
+        peak_gpu_util_pct=gpu_util_before,
+        popen=proc,
+    )
+
+
+def poll_active_job(job: ActiveJob) -> tuple[bool, int, str, str, str, str, float]:
+    """Poll an ``ActiveJob``.
+
+    Returns ``(finished, returncode, stdout, stderr, start_iso, end_iso, duration_s)``.
+    """
+    if job.mode == "silent":
+        assert job.popen is not None
+        rc = job.popen.poll()
+        if rc is None:
+            return False, 0, "", "", "", "", 0.0
+        stdout, stderr = job.popen.communicate()
+        end_dt = dt.datetime.now()
+        duration = round(time.monotonic() - job.start_mono, 4)
+        return True, rc, stdout, stderr, job.start_dt.isoformat(), end_dt.isoformat(), duration
+
+    # Visible terminal mode
+    assert job.done_file is not None
+    assert job.stdout_log is not None
+    assert job.stderr_log is not None
+    assert job.pid_file is not None
+
+    if job.done_file.is_file():
+        info = json.loads(job.done_file.read_text(encoding="utf-8"))
+        stdout = job.stdout_log.read_text(encoding="utf-8") if job.stdout_log.is_file() else ""
+        stderr = job.stderr_log.read_text(encoding="utf-8") if job.stderr_log.is_file() else ""
+        return (
+            True,
+            int(info.get("returncode", 0)),
+            stdout,
+            stderr,
+            str(info.get("start_time", job.start_dt.isoformat())),
+            str(info.get("end_time", dt.datetime.now().isoformat())),
+            float(info.get("duration_seconds", round(time.monotonic() - job.start_mono, 4))),
+        )
+
+    # Detect prematurely closed terminal window once worker PID has been written
+    if job.pid_file.is_file():
+        try:
+            worker_pid = int(job.pid_file.read_text(encoding="utf-8").strip())
+        except ValueError:
+            worker_pid = -1
+        if worker_pid > 0 and not _pid_is_alive(worker_pid) and not job.done_file.is_file():
+            end_dt = dt.datetime.now()
+            duration = round(time.monotonic() - job.start_mono, 4)
+            stdout = job.stdout_log.read_text(encoding="utf-8") if job.stdout_log.is_file() else ""
+            stderr = job.stderr_log.read_text(encoding="utf-8") if job.stderr_log.is_file() else ""
+            stderr += "\n[AutoRunner] Terminal window closed before task completion."
+            return True, -1, stdout, stderr, job.start_dt.isoformat(), end_dt.isoformat(), duration
+
+    return False, 0, "", "", "", "", 0.0
+
+
+# ---------------------------------------------------------------------------
+# Parallel Scheduler & Report Aggregation
+# ---------------------------------------------------------------------------
+
+
+def _result_rank_key(result: TaskExecutionResult) -> tuple[int, int, float, int]:
+    """Ranking key for picking the best seed run (smaller tuple is better).
+
+    Prefers feasible checked solutions, then lowest QOBLIB objective (minimization),
+    falling back to reported score and clean exit code.
+    """
+    checker = result.checker_result or {}
+    checked_obj = checker.get("objective")
+    feasible = checker.get("feasible") is True and checked_obj is not None
+    score = checked_obj if checked_obj is not None else result.reported_score
+    has_score = score is not None
+    numeric_score = float(score) if score is not None else float("inf")
+    exit_rank = 0 if result.exit_code == 0 else 1
+    return (0 if feasible else 1, 0 if has_score else 1, numeric_score, exit_rank)
+
+
+def _group_results_by_instance(
+    results: list[TaskExecutionResult],
+) -> list[tuple[str, list[TaskExecutionResult]]]:
+    """Group execution results by canonical instance name preserving first-seen order."""
+    grouped: dict[str, list[TaskExecutionResult]] = {}
+    for res in results:
+        grouped.setdefault(res.task.full_name, []).append(res)
+    return list(grouped.items())
+
+
+def _compute_gap(
+    score: int | float | None,
+    best_known: int | float | None,
+) -> float | None:
+    if score is None or best_known is None or best_known == 0:
+        return None
+    return round((float(score) - float(best_known)) / abs(float(best_known)), 6)
+
+
+def _format_gap(
+    score: int | float | None,
+    best_known: int | float | None,
+) -> str:
+    gap = _compute_gap(score, best_known)
+    return "N/A" if gap is None else f"{gap:+.2%}"
+
+
+def execute_task_stack(
+    *,
+    script_path: Path,
+    tasks: list[InstanceTask],
+    run_dir: Path,
+    local: bool,
+    silent: bool,
+    max_parallel: int,
+    csv_by_instance: dict[str, CsvBenchmarkRow],
+    track_credits: bool = False,
+    gpu_monitor: PassiveGPUMonitor | None = None,
+    extra_args: list[str] | None = None,
+) -> list[TaskExecutionResult]:
+    """Run all tasks with bounded parallelism, checking each solution as it completes."""
+    tmp_dir = run_dir / ".autorunner_tmp"
+    pending = list(tasks)
+    active: list[ActiveJob] = []
+    results_by_key: dict[str, TaskExecutionResult] = {}
+    multi_seed = len({t.solver_seed for t in tasks if t.solver_seed is not None}) > 1
+    monitor = gpu_monitor if local else None
+
+    if monitor is not None:
+        monitor.start(active)
+
+    try:
+        while pending or active:
+            launched_any = False
+
+            # Launch new tasks while slots and live CPU/RAM/GPU headroom allow
+            while pending and len(active) < max_parallel:
+                if monitor is not None:
+                    pending_idx = monitor.pick_next_task(pending, active, max_parallel)
+                    if pending_idx is None:
+                        break
+                    next_task = pending.pop(pending_idx)
+                    gpu_snaps = monitor.latest_snapshot()
+                else:
+                    next_task = pending.pop(0)
+                    gpu_snaps = None
+
+                task_cwd = get_task_work_dir(run_dir, next_task, multi_seed)
+                job = start_task_job(
+                    script_path=script_path,
+                    task=next_task,
+                    run_dir=run_dir,
+                    task_cwd=task_cwd,
+                    tmp_dir=tmp_dir,
+                    local=local,
+                    silent=silent,
+                    track_credits=track_credits,
+                    gpu_snapshots=gpu_snaps,
+                    extra_args=extra_args,
+                )
+                active.append(job)
+                if monitor is not None:
+                    monitor.start(active)
+                launched_any = True
+
+            still_active: list[ActiveJob] = []
+            for job in active:
+                finished, rc, stdout, stderr, start_iso, end_iso, duration = poll_active_job(job)
+                if not finished:
+                    still_active.append(job)
+                    continue
+
+                credits_used: float | None = None
+                if not local and track_credits and job.credits_before is not None:
+                    credits_after, _ = query_qoro_credits()
+                    if credits_after is not None:
+                        credits_used = round(max(0.0, job.credits_before - credits_after), 4)
+
+                gpu_telemetry: dict[str, Any] | None = None
+                if monitor is not None:
+                    gpus_after = monitor.poll_gpus(force=True)
+                    if gpus_after:
+                        util_after = max(
+                            (g.utilization_pct for g in gpus_after if g.utilization_pct is not None),
+                            default=None,
+                        )
+                        vram_after = round(sum(g.free_vram_gb for g in gpus_after), 2)
+                        temps = [g.temperature_c for g in gpus_after if g.temperature_c is not None]
+                        gpu_telemetry = {
+                            "util_before_pct": job.gpu_util_before_pct,
+                            "peak_util_pct": job.peak_gpu_util_pct,
+                            "util_after_pct": util_after,
+                            "vram_free_before_gb": job.gpu_vram_free_before_gb,
+                            "vram_free_after_gb": vram_after,
+                            "max_temp_after_c": max(temps) if temps else None,
+                            "throttling_observed": job.throttling_observed,
+                        }
+
+                reported_score, extra = parse_direct_task_output(stdout)
+                sol_path = find_solution_file(job.task_cwd, job.task, job.existing_sols_before)
+
+                checker_dict: dict[str, Any] | None = None
+                if sol_path is not None:
+                    checker_dict = run_solution_checker(sol_path, job.task)
+                else:
+                    checker_dict = {
+                        "returncode": None,
+                        "objective": None,
+                        "feasible": False,
+                        "breakdown": {},
+                        "violations": ["No .sol file produced by target script"],
+                        "raw_stdout": "",
+                    }
+
+                best_known, bench_meta = lookup_best_known_score(job.task, csv_by_instance)
+                sol_rel_path = (
+                    str(sol_path.relative_to(run_dir)) if sol_path is not None else None
+                )
+
+                exec_result = TaskExecutionResult(
+                    task=job.task,
+                    start_time=start_iso,
+                    end_time=end_iso,
+                    duration_seconds=duration,
+                    exit_code=rc,
+                    stdout=stdout,
+                    stderr=stderr,
+                    credits_used=credits_used,
+                    best_solution_file=sol_path.name if sol_path is not None else None,
+                    solution_rel_path=sol_rel_path,
+                    reported_score=reported_score,
+                    checker_result=checker_dict,
+                    best_known_score=best_known,
+                    benchmark_metadata=bench_meta,
+                    extra=extra,
+                    gpu_telemetry=gpu_telemetry,
+                )
+                results_by_key[job.task.run_key] = exec_result
+
+                checked_obj = checker_dict.get("objective") if checker_dict else None
+                feasible = checker_dict.get("feasible") if checker_dict else None
+                print(
+                    f"[DONE]   {job.task.display_name} | exit={rc} | {duration:.2f}s | "
+                    f"sol={exec_result.solution_rel_path} | score={checked_obj} "
+                    f"(feasible={feasible}) | best_known={best_known} | "
+                    f"gap={_format_gap(checked_obj, best_known)}"
+                )
+
+            active = still_active
+            if monitor is not None:
+                monitor.start(active)
+            if active or (pending and not launched_any):
+                time.sleep(0.2)
+    except KeyboardInterrupt:
+        print("\n[ABORT] Interrupted by user; terminating running tasks...", file=sys.stderr)
+        for job in active:
+            if job.popen is not None and job.popen.poll() is None:
+                job.popen.terminate()
+        raise
+    finally:
+        if monitor is not None:
+            monitor.stop()
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    ordered = [results_by_key[t.run_key] for t in tasks if t.run_key in results_by_key]
+
+    # When running multiple solver RNG seeds per instance, copy the winning .sol
+    # into the run root directory so the best solution is immediately available.
+    if multi_seed:
+        for inst_name, group in _group_results_by_instance(ordered):
+            best_r = min(group, key=_result_rank_key)
+            if best_r.solution_rel_path:
+                src_sol = run_dir / best_r.solution_rel_path
+                dst_sol = run_dir / src_sol.name
+                if src_sol.is_file() and src_sol.resolve() != dst_sol.resolve():
+                    shutil.copy2(src_sol, dst_sol)
+            best_obj = (best_r.checker_result or {}).get("objective")
+            score_display = best_obj if best_obj is not None else best_r.reported_score
+            print(
+                f"[BEST]   {inst_name} | best_solver_seed={best_r.task.solver_seed} | "
+                f"score={score_display} | sol={best_r.best_solution_file} | "
+                f"best_known={best_r.best_known_score} | "
+                f"gap={_format_gap(score_display, best_r.best_known_score)}"
+            )
+
+    return ordered
+
+
+def build_final_report(
+    *,
+    test_name: str,
+    script_path: Path,
+    run_dir: Path,
+    local: bool,
+    silent: bool,
+    selection_meta: dict[str, Any],
+    resource_report: dict[str, Any],
+    results: list[TaskExecutionResult],
+    throttle_events: list[dict[str, Any]] | None = None,
+    solver_args: list[str] | None = None,
+) -> dict[str, Any]:
+    """Assemble the final JSON structure specified in ``AutoRunner.md``."""
+    grouped = _group_results_by_instance(results)
+    instance_names = [name for name, _ in grouped]
+    per_instance_blocks: dict[str, Any] = {}
+    aggregated_extra: dict[str, Any] = {}
+
+    for inst_name, group in grouped:
+        best_r = min(group, key=_result_rank_key)
+        has_solver_seeds = any(r.task.solver_seed is not None for r in group)
+
+        checked_obj = (best_r.checker_result or {}).get("objective")
+        benchmark_score = checked_obj if checked_obj is not None else best_r.reported_score
+        gap_to_best_known = _compute_gap(benchmark_score, best_r.best_known_score)
+
+        inst_credits: float | None = None
+        if not local:
+            known = [r.credits_used for r in group if r.credits_used is not None]
+            if known:
+                inst_credits = round(sum(known), 4)
+
+        params_block: dict[str, Any] = {
+            "assets": best_r.task.assets,
+            "days": best_r.task.days,
+            "seed": best_r.task.seed,
+            "budget": best_r.task.budget,
+            "lambda": best_r.task.lam,
+            "lambda_tag": best_r.task.lam_tag,
+        }
+        output_block: dict[str, Any] = {
+            "best_solution_file": best_r.best_solution_file,
+            "benchmark_score": benchmark_score,
+            "reported_score": best_r.reported_score,
+            "gap_to_best_known": gap_to_best_known,
+            "solution_checker": best_r.checker_result,
+        }
+
+        if has_solver_seeds:
+            params_block["solver_seeds"] = [r.task.solver_seed for r in group]
+            params_block["best_solver_seed"] = best_r.task.solver_seed
+            output_block["best_solver_seed"] = best_r.task.solver_seed
+
+        block: dict[str, Any] = {
+            "start_time": min(r.start_time for r in group),
+            "end_time": max(r.end_time for r in group),
+            "duration_seconds": round(sum(r.duration_seconds for r in group), 4),
+            "exit_code": best_r.exit_code,
+            "parameters": params_block,
+            "credits_used": inst_credits,
+            "output": output_block,
+            "best_known_score": best_r.best_known_score,
+            "benchmark_metadata": best_r.benchmark_metadata,
+            "extra": best_r.extra,
+        }
+        if best_r.gpu_telemetry is not None:
+            block["gpu_telemetry"] = best_r.gpu_telemetry
+
+        if has_solver_seeds:
+            seed_entries: list[dict[str, Any]] = []
+            for r in group:
+                s_checked = (r.checker_result or {}).get("objective")
+                s_bench = s_checked if s_checked is not None else r.reported_score
+                seed_entry: dict[str, Any] = {
+                    "solver_seed": r.task.solver_seed,
+                    "start_time": r.start_time,
+                    "end_time": r.end_time,
+                    "duration_seconds": r.duration_seconds,
+                    "exit_code": r.exit_code,
+                    "credits_used": None if local else r.credits_used,
+                    "solution_file": r.solution_rel_path,
+                    "benchmark_score": s_bench,
+                    "reported_score": r.reported_score,
+                    "gap_to_best_known": _compute_gap(s_bench, r.best_known_score),
+                    "solution_checker": r.checker_result,
+                    "extra": r.extra,
+                }
+                if r.gpu_telemetry is not None:
+                    seed_entry["gpu_telemetry"] = r.gpu_telemetry
+                if r.exit_code != 0 and r.stderr.strip():
+                    seed_entry["stderr"] = r.stderr.strip()
+                seed_entries.append(seed_entry)
+            block["seed_runs"] = seed_entries
+        elif best_r.exit_code != 0 and best_r.stderr.strip():
+            block["stderr"] = best_r.stderr.strip()
+
+        per_instance_blocks[inst_name] = block
+        if best_r.extra:
+            aggregated_extra[inst_name] = best_r.extra
+
+    total_credits_used: float | None = None
+    if not local:
+        known_credits = [r.credits_used for r in results if r.credits_used is not None]
+        if known_credits:
+            total_credits_used = round(sum(known_credits), 4)
+
+    resources_out = dict(resource_report)
+    if throttle_events:
+        resources_out["gpu_throttle_events"] = throttle_events
+
+    return {
+        "test_name": test_name,
+        "instances": instance_names,
+        "run_config": {
+            "script": str(script_path.resolve()),
+            "solver_args": list(solver_args or []),
+            "run_dir": str(run_dir.relative_to(REPO_ROOT)),
+            "local": local,
+            "silent": silent,
+            "selection": selection_meta,
+            "resources": resources_out,
+            "total_credits_used": total_credits_used,
+        },
+        "results": per_instance_blocks,
+        "extra": aggregated_extra,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI Definition & Entrypoint
+# ---------------------------------------------------------------------------
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    risk_help = ", ".join(f"{i}={t}" for i, t in enumerate(RISK_LAMBDA_TAGS))
+    tests_help = ", ".join(f"{i}={n}" for i, n in enumerate(TEST_SUITE_NAMES))
+
+    parser = argparse.ArgumentParser(
+        prog="auto_runner.py",
+        description=(
+            "Run a QOBLIB portfolio optimization solver across multiple benchmark "
+            "instances in parallel, verify solutions with solution_checker.py, and "
+            "write structured JSON reports under AutoData/."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Pass solver options after -- (for example: -- --init handin --day-blocks --day-tscale 0.5).",
+    )
+
+    parser.add_argument(
+        "script",
+        nargs="?",
+        help="Path to the Python solver script to execute on each selected instance.",
+    )
+    parser.add_argument(
+        "--manual",
+        nargs="+",
+        metavar="IDX",
+        default=None,
+        help=(
+            "Manual selection: 0-based row indices from qoblib_instance_benchmarks.csv "
+            "(space- or comma-separated). Overwrites --tests, --seed, and --risk "
+            "(keeping --local)."
+        ),
+    )
+    parser.add_argument(
+        "--tests",
+        "-t",
+        default=None,
+        help=f"Predefined test suite by name or index ({tests_help}).",
+    )
+    parser.add_argument(
+        "--instance",
+        action="append",
+        metavar="SPEC",
+        help="Run an explicit instance, e.g. po_a400_t15_orig_b100_l1e-3. Repeat for multiple instances.",
+    )
+    parser.add_argument(
+        "--silent",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Execute tasks silently without opening terminal windows "
+            "(default: False, opens OS-native terminal windows; pass --silent for headless)."
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        "-s",
+        default=DEFAULT_SEED,
+        help=(
+            f"Data seed used wherever an instance has 'XX' ({', '.join(VALID_SEEDS)} "
+            f"or '00'/'01'/'02'; default: {DEFAULT_SEED}). Ignored by --manual, "
+            "CompareToOptimal, and 'all'."
+        ),
+    )
+    parser.add_argument(
+        "--solver-seeds",
+        "--solver-seed",
+        "--rng-seeds",
+        nargs="*",
+        metavar="SEED",
+        default=None,
+        help=(
+            "Solver RNG seed(s) passed to the target script via --solver-seed "
+            "(matching section 1.7 of 01_portfolio_optimisation.ipynb). Pass one "
+            "or more integers (e.g. --solver-seeds 1 2 3 or 1,2,3), or pass "
+            "--solver-seeds with no values to default to 1 2 3. Each seed runs "
+            "independently and the best feasible .sol is promoted."
+        ),
+    )
+    parser.add_argument(
+        "--local",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run locally (--local, default) or on Qoro cloud (--no-local).",
+    )
+    parser.add_argument(
+        "--cloud",
+        action="store_true",
+        default=False,
+        help="Shorthand alias for --no-local (run on Qoro cloud using credits).",
+    )
+    parser.add_argument(
+        "--risk",
+        "-r",
+        type=int,
+        default=DEFAULT_RISK_INDEX,
+        help=(
+            f"Risk aversion lambda index 0..7 ({risk_help}; default: "
+            f"{DEFAULT_RISK_INDEX}={RISK_LAMBDA_TAGS[DEFAULT_RISK_INDEX]}). "
+            "Overwritten by risk test suites."
+        ),
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Optional override for maximum parallel workers (default: auto-calculated).",
+    )
+    parser.add_argument(
+        "--gpu-monitor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Passively monitor local GPU load/VRAM/temperature in the background "
+            "to pace launches and prevent throttling (default: True; --no-gpu-monitor to disable)."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-max-util",
+        type=float,
+        default=GPU_MAX_UTIL_DEFAULT,
+        help=(
+            "Maximum projected GPU utilization %% before holding back new parallel launches "
+            f"(default: {GPU_MAX_UTIL_DEFAULT})."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-vram-headroom",
+        type=float,
+        default=GPU_VRAM_HEADROOM_PCT_DEFAULT,
+        help=(
+            "Minimum %% of GPU VRAM kept free to prevent OOM/throttling "
+            f"(default: {GPU_VRAM_HEADROOM_PCT_DEFAULT})."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-max-temp",
+        type=float,
+        default=GPU_MAX_TEMP_C_DEFAULT,
+        help=(
+            "GPU temperature threshold (°C) above which new parallel launches pause to cool "
+            f"(default: {GPU_MAX_TEMP_C_DEFAULT})."
+        ),
+    )
+    parser.add_argument(
+        "--low-credit-threshold",
+        type=float,
+        default=LOW_CREDIT_THRESHOLD_DEFAULT,
+        help=(
+            "Cloud credit balance below which tasks run sequentially one at a time "
+            f"(default: {LOW_CREDIT_THRESHOLD_DEFAULT})."
+        ),
+    )
+    parser.add_argument(
+        "--list-tests",
+        action="store_true",
+        help="Print all predefined test suites and exit.",
+    )
+    parser.add_argument(
+        "--list-instances",
+        action="store_true",
+        help="Print all indexed rows from qoblib_instance_benchmarks.csv and exit.",
+    )
+    parser.add_argument(
+        "--_worker",
+        dest="worker_spec",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    return parser
+
+
+def resolve_script_path(raw_script: str) -> Path:
+    """Resolve the target Python script relative to CWD or repository root."""
+    candidate = Path(raw_script)
+    if candidate.is_file():
+        return candidate.resolve()
+    repo_candidate = REPO_ROOT / raw_script
+    if repo_candidate.is_file():
+        return repo_candidate.resolve()
+    raise FileNotFoundError(f"Target solver script not found: {raw_script!r}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if "--" in raw_argv:
+        sep = raw_argv.index("--")
+        runner_argv = raw_argv[:sep]
+        script_extra_args = raw_argv[sep + 1 :]
+    else:
+        runner_argv = raw_argv
+        script_extra_args = []
+
+    parser = build_arg_parser()
+    args = parser.parse_args(runner_argv)
+
+    # Internal worker mode invoked inside visible OS terminals
+    if args.worker_spec is not None:
+        return run_worker_shim(Path(args.worker_spec))
+
+    csv_rows = load_benchmark_csv(BENCHMARKS_CSV)
+    csv_by_instance = {row.instance: row for row in csv_rows}
+
+    if args.list_tests:
+        print("Available test suites (pass name or index to --tests):")
+        for idx, (name, specs) in enumerate(TEST_SUITES_ORDERED):
+            detail = f"{len(csv_rows)} CSV instances" if name == "all" else ", ".join(specs)
+            print(f"  [{idx}] {name}: {detail}")
+        return 0
+
+    if args.list_instances:
+        print(f"Instances in {BENCHMARKS_CSV.name} (pass 0-based indices to --manual):")
+        for row in csv_rows:
+            print(f"  [{row.index:2d}] {row.instance:<20s} | {row.parameters} | status={row.status}")
+        return 0
+
+    if not args.script:
+        parser.error("the following arguments are required: script")
+
+    try:
+        script_path = resolve_script_path(args.script)
+    except FileNotFoundError as exc:
+        parser.error(str(exc))
+
+    local = False if args.cloud else bool(args.local)
+    silent = bool(args.silent)
+
+    if args.manual is not None and (args.tests is not None):
+        print(
+            "[INFO] --manual specified: overwriting --tests, --seed, and --risk "
+            "(keeping --local).",
+            file=sys.stderr,
+        )
+
+    try:
+        solver_seeds = parse_solver_seeds(args.solver_seeds)
+        test_name, tasks, selection_meta = build_task_stack(
+            csv_rows=csv_rows,
+            manual_tokens=args.manual,
+            test_arg=args.tests,
+            seed_arg=args.seed,
+            risk_index=args.risk,
+            solver_seeds=solver_seeds,
+            instance_specs=args.instance,
+        )
+        for task in tasks:
+            resolve_warm_start_args(script_path, task, script_extra_args)
+        if script_path.name in DAY_SWAP_SCRIPTS and not local:
+            raise ValueError(f"{script_path.name} is a local-only solver")
+        if script_path.name == "day_swap_parallel.py" and args.max_workers is None:
+            # Each benchmark job launches its own pool of day shards.
+            args.max_workers = 1
+    except (ValueError, FileNotFoundError) as exc:
+        parser.error(str(exc))
+
+    gpu_monitor: PassiveGPUMonitor | None = None
+    if local:
+        gpu_policy = GPUThrottlePolicy(
+            enabled=bool(args.gpu_monitor),
+            max_util_pct=args.gpu_max_util,
+            vram_headroom_pct=args.gpu_vram_headroom,
+            max_temp_c=args.gpu_max_temp,
+        )
+        gpu_monitor = PassiveGPUMonitor(gpu_policy)
+        initial_gpus = gpu_monitor.poll_gpus(force=True)
+        max_parallel, resource_report = calculate_local_concurrency(
+            tasks,
+            gpu_policy=gpu_policy,
+            gpus=initial_gpus,
+            max_workers_override=args.max_workers,
+        )
+        gpu_summary = (
+            ", ".join(
+                f"{g.device_str}({g.name}, {g.free_vram_gb:.1f}/{g.total_vram_gb:.1f}GB free"
+                + (f", util={g.utilization_pct:.0f}%" if g.utilization_pct is not None else "")
+                + (f", temp={g.temperature_c:.0f}C" if g.temperature_c is not None else "")
+                + (", THROTTLING" if g.throttling else "")
+                + ")"
+                for g in initial_gpus
+            )
+            if initial_gpus
+            else ("disabled" if not gpu_policy.enabled else "none")
+        )
+        print(
+            f"[RESOURCES] Local mode: "
+            f"{resource_report['system']['cpu_count']} CPUs, "
+            f"{resource_report['system']['available_ram_gb']} GB RAM available, "
+            f"GPU monitor=[{gpu_summary}] -> running up to {max_parallel} task(s) in parallel."
+        )
+    else:
+        max_parallel, resource_report = calculate_cloud_concurrency(
+            tasks,
+            low_credit_threshold=args.low_credit_threshold,
+            max_workers_override=args.max_workers,
+        )
+        print(f"[CREDITS] Cloud mode: {resource_report['reason']}")
+
+    run_dir = create_run_directory(test_name)
+    print(f"[RUN] Test={test_name} | Tasks={len(tasks)} | Output dir={run_dir}")
+
+    track_credits = bool(
+        not local and resource_report.get("credit_check", {}).get("available", False)
+    )
+    results = execute_task_stack(
+        script_path=script_path,
+        tasks=tasks,
+        run_dir=run_dir,
+        local=local,
+        silent=silent,
+        max_parallel=max_parallel,
+        csv_by_instance=csv_by_instance,
+        track_credits=track_credits,
+        gpu_monitor=gpu_monitor,
+        extra_args=script_extra_args,
+    )
+
+    finished_at = dt.datetime.now()
+    report = build_final_report(
+        test_name=test_name,
+        script_path=script_path,
+        run_dir=run_dir,
+        local=local,
+        silent=silent,
+        selection_meta=selection_meta,
+        resource_report=resource_report,
+        results=results,
+        throttle_events=gpu_monitor.throttle_events if gpu_monitor is not None else None,
+        solver_args=script_extra_args,
+    )
+    json_path = get_unique_json_path(run_dir, test_name, finished_at)
+    json_path.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    print(f"[SAVED] Report written to {json_path}")
+
+    return 0 if all(r.exit_code == 0 for r in results) else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

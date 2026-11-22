@@ -4,8 +4,8 @@
 Starts the runs below at the same time (each through auto_runner.py with init_comp.py as the
 worker), and as soon as one finishes, draws its plot with ``init_comp.py --plot``.
 
-    python run_init_comp.py              # terminal windows per instance (shows progress)
-    python run_init_comp.py --silent     # no extra windows; progress in AutoData/<run>/*.log
+    python experiments/run_init_comp.py              # terminal windows per instance (shows progress)
+    python experiments/run_init_comp.py --silent     # no extra windows; progress in AutoData/<run>/*.log
 
 Ctrl+C stops all runs; whatever finished is still plotted.
 Smoke test (minutes instead of hours): set INIT_COMP_QUICK=1 before running.
@@ -20,7 +20,7 @@ import threading
 import time
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent
+REPO = Path(__file__).resolve().parent.parent  # repo root
 PY = sys.executable
 
 # (label, runner arguments, runs in parallel inside each instance, expected duration)
@@ -33,7 +33,7 @@ JOBS = [
 def run_job(label: str, runner_args: list[str], workers: int, silent: bool, out: dict) -> None:
     """One auto_runner.py call; streams its output with a prefix, then plots its run directory."""
     env = {**os.environ, "INIT_COMP_WORKERS": str(workers), "PYTHONIOENCODING": "utf-8"}
-    cmd = [PY, str(REPO / "auto_runner.py"), "init_comp.py", *runner_args, *(["--silent"] if silent else [])]
+    cmd = [PY, str(REPO / "auto_runner.py"), "experiments/init_comp.py", *runner_args, *(["--silent"] if silent else [])]
     run_dirs = []
     proc = subprocess.Popen(cmd, cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, encoding="utf-8", errors="replace")
@@ -47,7 +47,7 @@ def run_job(label: str, runner_args: list[str], workers: int, silent: bool, out:
         if not any(Path(run_dir).glob("*.json")):
             print(f"[{label}] no results JSON in {run_dir}: nothing to plot", flush=True)
             continue
-        plot = subprocess.run([PY, str(REPO / "init_comp.py"), "--plot", run_dir], cwd=REPO, env=env,
+        plot = subprocess.run([PY, str(REPO / "experiments" / "init_comp.py"), "--plot", run_dir], cwd=REPO, env=env,
                               capture_output=True, text=True, encoding="utf-8", errors="replace")
         for line in (plot.stdout + plot.stderr).strip().splitlines():
             print(f"[{label}] {line}", flush=True)
@@ -59,7 +59,7 @@ def main() -> int:
     start = time.time()
     print(f"Started {time.strftime('%H:%M')}{'  [QUICK smoke test]' if quick else ''}")
     for label, args, workers, eta in JOBS:
-        print(f"  {label:6s} auto_runner.py init_comp.py {' '.join(args)}   "
+        print(f"  {label:6s} auto_runner.py experiments/init_comp.py {' '.join(args)}   "
               f"INIT_COMP_WORKERS={workers}   {eta}")
     print("Ctrl+C stops everything and still plots what finished.\n", flush=True)
 
