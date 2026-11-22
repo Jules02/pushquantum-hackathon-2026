@@ -318,13 +318,19 @@ def clamp_and_iterate(
 # ── iterated local search ────────────────────────────────────────────────
 
 
-def kick(model: qt.PortfolioModel, ev: "BlockEvaluator", L, S, rng, n_blocks: int, size: int):
-    """Set ``n_blocks`` random (day, asset-group) blocks to random feasible holdings."""
+def kick(model: qt.PortfolioModel, ev: "BlockEvaluator", L, S, rng, n_blocks: int, size: int,
+         one_day: bool = False):
+    """Set ``n_blocks`` random (day, asset-group) blocks to random feasible holdings.
+
+    With ``one_day`` all blocks fall on the same random day, so the re-optimisation
+    after the kick only has to cover that day and its two neighbours.
+    """
     T, n = model.n_periods, len(model.symbols)
     L, S = L.copy(), S.copy()
     days = []
+    t_fixed = int(rng.integers(T))
     for _ in range(n_blocks):
-        t = int(rng.integers(T))
+        t = t_fixed if one_day else int(rng.integers(T))
         G = np.sort(rng.choice(n, size=min(size, n), replace=False))
         V = _net_configs(len(G), model.ub)
         _, ok = ev.costs(L, S, [t], G, V)
@@ -347,6 +353,8 @@ def iterated_search(
     verbose: bool = True,
     day_solver: BlockSolver | None = None,
     day_share: float = 0.5,
+    kick_one_day: bool = False,
+    on_improve: Callable | None = None,
 ) -> dict:
     """Clamp-and-iterate, then repeated kicks + local re-optimisation (keep if better).
 
@@ -404,12 +412,14 @@ def iterated_search(
                 best_L, best_S, best = r["L"], r["S"], r["score"]
                 day_improvements += 1
                 trace.append((round(time.time() - t0, 1), best))
+                if on_improve is not None:
+                    on_improve(best_L, best_S, best)
                 if verbose:
                     print(f"  {time.time() - t0:6.1f}s  day move {day_moves}: {best}", flush=True)
             t_day += time.time() - t1
             continue
         t1 = time.time()
-        L2, S2, kdays = kick(model, ev, best_L, best_S, rng, kick_blocks, kick_size)
+        L2, S2, kdays = kick(model, ev, best_L, best_S, rng, kick_blocks, kick_size, one_day=kick_one_day)
         if not model.score_arrays(L2, S2).feasible:
             t_kick += time.time() - t1
             continue
@@ -427,6 +437,8 @@ def iterated_search(
             best_L, best_S, best = r["L"], r["S"], r["score"]
             improvements += 1
             trace.append((round(time.time() - t0, 1), best))
+            if on_improve is not None:
+                on_improve(best_L, best_S, best)
             if verbose:
                 print(f"  {time.time() - t0:6.1f}s  kick {kicks}: {best}", flush=True)
         t_kick += time.time() - t1
@@ -577,9 +589,11 @@ def main() -> None:
     # pipeline: SA start -> blocks -> iterated search -> .sol file
     ap.add_argument("--time", type=float, default=120.0, help="iterated-search time limit (s)")
     ap.add_argument("--kick-blocks", type=int, default=6)
+    ap.add_argument("--kick-one-day", action="store_true", help="put all kicked blocks on one day")
     ap.add_argument("--sa-reads", type=int, default=20)
     ap.add_argument("--sa-sweeps", type=int, default=2000)
     ap.add_argument("--no-sa", action="store_true", help="start from an empty portfolio")
+    ap.add_argument("--init", default=None, help="start from this .sol file (skips SA)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--solutions", default="solutions")
     add_solver_args(ap)
@@ -639,6 +653,8 @@ def add_solver_args(ap: argparse.ArgumentParser) -> None:
                     help="also re-solve whole days (all assets) with integer SA (big_blocks.py)")
     ap.add_argument("--day-chains", type=int, default=64, help="SA chains per whole-day block")
     ap.add_argument("--day-sweeps", type=int, default=300, help="SA sweeps per whole-day block")
+    ap.add_argument("--day-tscale", type=float, default=1.0,
+                    help="multiply the whole-day SA start temperature (<1 = refine a good start)")
     ap.add_argument("--day-share", type=float, default=0.5,
                     help="share of the search time spent on whole-day moves instead of kicks")
 
@@ -663,7 +679,14 @@ def run_pipeline(model: qt.PortfolioModel, bkv, args) -> dict:
     rec = dict(instance=model.instance.name, budget=model.budget, lam=args.lam, bkv=bkv,
                size=args.size, method=args.methods[0], time_limit=args.time,
                kick_blocks=args.kick_blocks, seed=args.seed)
-    if args.no_sa:
+    if getattr(args, "init", None):
+        _, pos = qt.read_portfolio_solution(args.init)
+        L, S = (a.astype(np.int64) for a in model.to_arrays(pos))
+        sc0 = model.score_arrays(L, S)
+        assert sc0.feasible, f"{args.init} is infeasible"
+        rec["start"], rec["init"] = sc0.objective, args.init
+        print(f"  start ({args.init}): {fmt(sc0.objective)}", flush=True)
+    elif args.no_sa:
         L = S = None
         rec["start"] = model.score_arrays(np.zeros((model.n_periods, len(model.symbols)), np.int64),
                                           np.zeros((model.n_periods, len(model.symbols)), np.int64)).objective
@@ -677,10 +700,22 @@ def run_pipeline(model: qt.PortfolioModel, bkv, args) -> dict:
     if getattr(args, "day_blocks", False):
         from big_blocks import SABlockSolver  # imports this module: keep it lazy
 
-        day_solver = SABlockSolver(chains=args.day_chains, sweeps=args.day_sweeps, seed=args.seed)
-    r = iterated_search(model, groups, L=L, S=S, time_limit=args.time, kick_blocks=args.kick_blocks,
+        day_solver = SABlockSolver(chains=args.day_chains, sweeps=args.day_sweeps, seed=args.seed,
+                                   t_scale=getattr(args, "day_tscale", 1.0))
+    ckpt = Path(args.solutions) / f"{model.instance.name}_b{model.budget:03d}_l{args.lam}.ckpt.sol"
+    last_ck = [time.time()]
+
+    def on_improve(L_, S_, score_):
+        print(f"  {time.time() - t0:7.0f}s  {score_}", flush=True)
+        if time.time() - last_ck[0] > 120:
+            Path(args.solutions).mkdir(parents=True, exist_ok=True)
+            model.write_solution(ckpt, model.to_positions(L_, S_), comment=f"checkpoint {score_}")
+            last_ck[0] = time.time()
+
+    r = iterated_search(model, groups, L=L, S=S, time_limit=args.time, on_improve=on_improve, kick_blocks=args.kick_blocks,
                         kick_size=args.size, solver=solver, seed=args.seed, verbose=False,
-                        day_solver=day_solver, day_share=getattr(args, "day_share", 0.5))
+                        day_solver=day_solver, day_share=getattr(args, "day_share", 0.5),
+                        kick_one_day=getattr(args, "kick_one_day", False))
     rec["solver"] = describe()
     if day_solver is not None:
         rec["day_blocks"] = dict(day_solver.summary(), share=args.day_share, moves=r["day_moves"],
@@ -704,7 +739,7 @@ def run_pipeline(model: qt.PortfolioModel, bkv, args) -> dict:
                          comment=f"asset groups of {args.size} ({args.methods[0]}), {rec['solver']['name']} block solver"
                                  f"{' + whole-day SA blocks' if day_solver is not None else ''}"
                                  f" + iterated search, "
-                                 f"{'empty' if args.no_sa else 'SA'} start")
+                                 f"{'warm (' + Path(args.init).name + ')' if getattr(args, 'init', None) else 'empty' if args.no_sa else 'SA'} start")
     rec["solution_file"] = str(sol)
     Path(args.out).mkdir(parents=True, exist_ok=True)
     tag = ("" if rec["solver"]["name"] == "exact" else f"_{rec['solver']['name']}") + ("_days" if day_solver else "")

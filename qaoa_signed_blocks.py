@@ -198,7 +198,10 @@ class QAOABlockSolver:
         self.cache: dict = {}
         self.stats = dict(calls=0, cache_hits=0, qaoa_runs=0, mu_raised=0, proposals=0,
                           no_feasible=0, qaoa_seconds=0.0, exact_checked=0, exact_hits=0,
-                          sample_hits=0, exact_gap=0.0)
+                          sample_hits=0, exact_gap=0.0,
+                          mu_stage=[0] * (1 + len(self.mu_ladder)))
+        # mu_stage[k]: fresh calls that stopped at ladder stage k (k = 0: mu = 0);
+        # a call that never got a feasible lowest-energy sample counts in the last stage
 
     def _key(self, L, S, days, G):
         lo, hi, T = days[0], days[-1], len(L)
@@ -274,6 +277,7 @@ class QAOABlockSolver:
             e = bqm.energies((bits, list(range(bits.shape[1]))))
             if okq[int(np.argmin(e))]:
                 break
+        self.stats["mu_stage"][k] += 1
         self.stats["no_feasible"] += int(not any_feasible)
         self.stats["proposals"] += int(best_c < cur_cost - 1e-9)
         if self.compare_exact:

@@ -1,8 +1,8 @@
-# asset groups of 3 (random), exact block solver + whole-day SA blocks + iterated search, SA start
+# day_swap.py: whole-day pair-move descent + per-day ILS from handin/po_a050_t10_orig_b020_l1e-3.sol
 instance po_a050_t10_orig
 budget 20
 lambda 0.001
-objective -205926
+objective -206239
 # period symbol long short
 0 AAPL 0 1
 0 AVGO 1 0
@@ -22,18 +22,19 @@ objective -205926
 0 PEP 0 1
 0 TMO 0 1
 0 UNH 0 1
+1 AAPL 1 0
+1 AVGO 1 0
 1 BX 0 2
 1 CAT 1 0
 1 COST 0 1
-1 CRM 1 0
-1 CSCO 0 3
-1 DIS 1 0
+1 CSCO 0 2
 1 IBM 0 1
 1 ISRG 0 1
-1 JPM 1 0
-1 MRK 2 0
+1 JPM 2 0
+1 MRK 1 0
 1 NOW 1 0
-1 PG 1 0
+1 PM 1 0
+1 TMO 0 1
 1 TSLA 0 1
 1 UNH 0 3
 2 AAPL 1 0
@@ -60,35 +61,40 @@ objective -205926
 3 META 3 0
 3 MSFT 1 0
 3 NFLX 0 2
+3 TMUS 1 0
 3 TSLA 1 0
 3 WFC 1 0
 4 ADBE 0 1
 4 DIS 3 0
 4 GE 2 0
-4 LIN 3 0
+4 GS 0 1
+4 LIN 2 0
 4 MA 1 0
 4 META 1 0
-4 MS 0 2
+4 MS 0 1
 4 NOW 2 0
 4 NVDA 0 1
 4 PM 0 1
+4 TMUS 1 0
 4 TSLA 0 1
 4 WFC 1 0
 4 XOM 1 0
 5 AAPL 0 1
 5 ADBE 0 1
-5 AMZN 3 0
-5 CAT 0 3
+5 AMZN 2 0
+5 CAT 0 2
 5 GE 1 0
 5 GOOG 1 0
 5 HD 1 0
-5 IBM 2 0
+5 IBM 1 0
 5 LIN 0 1
 5 MA 1 0
 5 META 0 2
 5 MRK 0 1
+5 NOW 1 0
+5 PM 1 0
 5 TSLA 1 0
-5 UNH 0 1
+5 UNH 0 2
 6 ABT 1 0
 6 AMZN 2 0
 6 AXP 0 2
