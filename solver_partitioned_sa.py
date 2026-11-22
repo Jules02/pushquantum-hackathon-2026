@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """QOBLIB portfolio solver: clamp asset/day blocks, solve each QUBO with SA.
 
-Run from the Project directory (NumPy, SciPy, requests, dimod, dwave-samplers):
+Run from the Project directory (requires NumPy, SciPy, requests and dimod):
     python auto_runner_extensive.py solver_partitioned_sa.py --manual 0 --silent
 
 Pass solver options after the runner's ``--`` separator, e.g. ``--reheats 2``.
-No Divi, Maestro, or credentials are needed for the default CPU solver.
+Uses the optional dwave-samplers package when available; otherwise uses NumPy.
+No Divi, Maestro, or credentials are needed.
 """
 
 from __future__ import annotations
@@ -14,15 +15,15 @@ import argparse
 import json
 import os
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 import re
+import sys
 import time
 from typing import Protocol
 
 import dimod
 import numpy as np
-from dwave.samplers import SimulatedAnnealingSampler
-from dwave.samplers.sa.sampler import default_beta_range
 
 import qoblib_tools as qt
 from asset_groups import BlockEvaluator, BlockResult, clamp_and_iterate, grouping_fn
@@ -32,6 +33,48 @@ from qaoa_signed_blocks import CODES, block_qubo, decode
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_SEEDS = (1, 2, 3)
+
+
+@lru_cache(maxsize=1)
+def load_dwave_sampler():
+    """Import the optional compiled backend only when it is requested."""
+    from dwave.samplers import SimulatedAnnealingSampler
+    from dwave.samplers.sa.sampler import default_beta_range
+
+    return SimulatedAnnealingSampler(), default_beta_range
+
+
+def numpy_anneal(bqm, starts, rng, reads, sweeps, temperature_scale, restart_all_reads):
+    """Metropolis annealing of a binary BQM, vectorized over independent reads."""
+    n = bqm.num_variables
+    linear = np.array([bqm.linear[j] for j in range(n)], dtype=float)
+    coupling = np.zeros((n, n), dtype=float)
+    for (i, j), bias in bqm.quadratic.items():
+        coupling[i, j] = coupling[j, i] = bias
+    starts = starts[:reads]
+    if restart_all_reads and len(starts):
+        states = starts[np.arange(reads) % len(starts)].astype(float)
+    else:
+        states = rng.integers(0, 2, size=(reads, n)).astype(float)
+        states[:len(starts)] = starts
+
+    # Max absolute flip cost per bit, computed in the centered spin form.
+    flip_bound = (np.abs(linear + 0.5 * coupling.sum(axis=1))
+                  + 0.5 * np.abs(coupling).sum(axis=1))
+    active = flip_bound[flip_bound > 0]
+    if not len(active):
+        return states.astype(np.int8)
+    # Start hot enough to cross large barriers, then cool below a typical flip scale.
+    hot = active.max() * temperature_scale / 0.5
+    cold = np.median(active) / 12.0
+    temperatures = np.geomspace(hot, cold, sweeps) if sweeps > 1 else (cold,)
+    for temperature in temperatures:
+        thresholds = rng.standard_exponential((n, reads)) * temperature
+        for k, j in enumerate(rng.permutation(n)):
+            delta = (1.0 - 2.0 * states[:, j]) * (linear[j] + states @ coupling[j])
+            flip = delta <= thresholds[k]
+            states[flip, j] = 1.0 - states[flip, j]
+    return states.astype(np.int8)
 
 
 class BlockStage(Protocol):
@@ -53,14 +96,21 @@ class AnnealStage:
     sweeps: int
     start_temperature_scale: float = 1.0
     restart_all_reads: bool = False
+    backend: str = "numpy"
 
     def __call__(
         self, bqm: dimod.BinaryQuadraticModel, starts: np.ndarray, rng: np.random.Generator
     ) -> np.ndarray:
+        if self.backend == "numpy":
+            return numpy_anneal(
+                bqm, starts, rng, self.reads, self.sweeps,
+                self.start_temperature_scale, self.restart_all_reads,
+            )
+        sampler, default_beta_range = load_dwave_sampler()
         labels = list(range(bqm.num_variables))
         # β is inverse temperature; a scale > 1 starts hotter.
         beta_hot, beta_cold = default_beta_range(bqm)
-        samples = SimulatedAnnealingSampler().sample(
+        samples = sampler.sample(
             bqm,
             num_reads=self.reads,
             num_sweeps=self.sweeps,
@@ -181,6 +231,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--patience", type=positive_int, default=2, help="Stop after this many non-improving passes")
     p.add_argument("--sa-reads", type=positive_int, default=24)
     p.add_argument("--sa-sweeps", type=positive_int, default=120, help="SA sweeps per read per stage")
+    p.add_argument("--sa-backend", choices=("auto", "numpy", "dwave"), default="auto",
+                   help="Auto prefers dwave-samplers and falls back to NumPy (default: auto)")
     p.add_argument("--reheats", type=int, default=1, help="Extra warm-started stages per block; 0 disables reheats")
     p.add_argument("--reheat-temperature-scale", type=float, default=2.0, help="Initial temperature multiplier for reheats")
     p.add_argument("--integer-polish", action="store_true", help="Finish each block with constrained integer SA")
@@ -215,6 +267,21 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--solver-seed must be nonnegative")
 
     started = time.perf_counter()
+    backend = "numpy" if args.sa_backend == "numpy" else "dwave"
+    if backend == "dwave":
+        try:
+            load_dwave_sampler()
+        except (ImportError, OSError) as exc:
+            if args.sa_backend == "dwave":
+                p.error(f"D-Wave sampler unavailable ({exc}). Run "
+                        f'"{sys.executable}" -m pip install -U dwave-samplers '
+                        "or choose --sa-backend numpy.")
+            backend = "numpy"
+            print(f"D-Wave sampler unavailable ({exc}); using NumPy.", flush=True)
+    print(f"SA backend: {backend} on CPU; up to {args.block_sweeps} block passes per seed, "
+          f"{args.sa_reads} reads × {args.sa_sweeps} sweeps per stage, {args.reheats} reheats.",
+          flush=True)
+
     inst = load_instance(args.instance, Path(args.instance_dir) if args.instance_dir else None)
     if args.assets is not None and inst.n_assets != args.assets:
         raise ValueError(f"Asset count mismatch for {inst.name}: expected {args.assets}, got {inst.n_assets}")
@@ -226,8 +293,9 @@ def main(argv: list[str] | None = None) -> int:
     model = qt.PortfolioModel(inst, budget=args.budget, lam=args.lam)
     if not model.score({}).feasible:
         raise ValueError("The empty portfolio is infeasible for this budget; cannot initialize the block solver")
-    stages = (AnnealStage(args.sa_reads, args.sa_sweeps),) + (
-        AnnealStage(args.sa_reads, args.sa_sweeps, args.reheat_temperature_scale, restart_all_reads=True),
+    stages = (AnnealStage(args.sa_reads, args.sa_sweeps, backend=backend),) + (
+        AnnealStage(args.sa_reads, args.sa_sweeps, args.reheat_temperature_scale,
+                    restart_all_reads=True, backend=backend),
     ) * args.reheats
     groups = grouping_fn(model, args.group_size, args.group_method)
     seeds = DEFAULT_SEEDS if args.solver_seed is None else (args.solver_seed,)
@@ -272,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
             "assets": inst.n_assets, "days": inst.n_periods, "budget": args.budget, "lambda": args.lam,
             "cloud": False, "cloud_requested": args.cloud, "gpu_used": False,
             "gpu_backend": None, "gpu_device": None, "device": "cpu",
-            "simulator_backend": "dwave_simulated_annealing",
+            "simulator_backend": f"{backend}_simulated_annealing",
             "backend_detail": "Local CPU; no quantum circuits executed",
             "feasible": bool(written.feasible), "breakdown": written.breakdown,
             "violations": list(written.violations), "solution_file": sol_path.name,
@@ -281,7 +349,7 @@ def main(argv: list[str] | None = None) -> int:
             "best_seed": best_seed, "total_circuits": 0, "seed_runs": seed_runs,
             "total_duration_seconds": round(time.perf_counter() - started, 3),
             "sa": {
-                "reads": args.sa_reads, "sweeps": args.sa_sweeps, "reheats": args.reheats,
+                "backend": backend, "reads": args.sa_reads, "sweeps": args.sa_sweeps, "reheats": args.reheats,
                 "reheat_temperature_scale": args.reheat_temperature_scale,
                 "group_method": args.group_method, "group_size_assets": args.group_size,
                 "max_block_sweeps": args.block_sweeps, "patience": args.patience,
