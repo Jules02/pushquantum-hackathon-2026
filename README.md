@@ -166,6 +166,9 @@ print(qt.check_network_solution("network12.sol", 12, qt.load_network_demand(12))
 | `00_main_qubo_101.ipynb` | Main notebook: setup, QUBO 101, choosing a problem, handing in |
 | `01_portfolio_optimisation.ipynb` | Portfolio optimisation (QOBLIB 06) |
 | `02_network_design.ipynb` | Network design (QOBLIB 08) |
+| `03_encoding_and_objectives.ipynb` | Copy of 01 plus a comparison of PCE encodings and objectives |
+| `handin/` | Our hand-in: verified `.sol` files, `README.md`, `RESULTS.md`, `QUANTUM_STORY.md` |
+| `experiments/` | Dead-end and side experiments not used by the hand-in, kept for the record |
 | `qoblib_tools.py` | Helper and referee for 01 and 02 |
 | `LICENSE` | Apache-2.0 |
 

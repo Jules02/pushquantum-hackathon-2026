@@ -38,7 +38,7 @@ import warnings
 
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parent.parent  # repo root
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 

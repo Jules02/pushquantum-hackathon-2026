@@ -1,12 +1,17 @@
 """Run the grouping pipeline over a grid of instances and summarise the gaps.
 
-    python benchmark_groups.py --instances po_a050_t10_orig po_a050_t10_s00 ... \
+    python experiments/benchmark_groups.py --instances po_a050_t10_orig po_a050_t10_s00 ... \
         --budget 20 --lams 1e-4 1e-3 1e-2 --time 120
 
 Each run is ``asset_groups.py pipeline`` (SA start -> blocks -> iterated search), in
 its own process; results are read back from ``results/pipeline_*.json``.
 """
 from __future__ import annotations
+
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # repo root: qoblib_tools & co.
 
 import argparse
 import json

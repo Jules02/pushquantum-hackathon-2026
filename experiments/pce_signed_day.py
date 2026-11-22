@@ -6,9 +6,14 @@ parity readout gives dense bit patterns. In the signed encoding (see
 retest. Budget: Lagrangian ``mu * units`` (units are quadratic in this encoding), with
 ``mu`` picked by SA on the same QUBO; then exact repair + official score.
 
-    python pce_signed_day.py --days 0 3 6
+    python experiments/pce_signed_day.py --days 0 3 6
 """
 from __future__ import annotations
+
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # repo root: qoblib_tools & co.
 
 import argparse
 import json

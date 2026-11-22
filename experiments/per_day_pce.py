@@ -6,7 +6,7 @@ neighbouring days then become linear terms, and the sub-problem's energy equals 
 official score of the whole portfolio. The day's budget is passed to Divi as a
 ``LinearConstraint``, so infeasible samples can be filtered out.
 
-Two experiments (``python per_day_pce.py --help``):
+Two experiments (``python experiments/per_day_pce.py --help``):
 
 * ``oracle``: each day solved with the other days fixed to the best-known solution.
   This isolates PCE's quality on a single day: its result is compared with the
@@ -23,6 +23,11 @@ instead of the exact optimum, and ``--solver sa`` (simulated annealing on the sa
 day sub-problem, constraints as penalties) is the classical control.
 """
 from __future__ import annotations
+
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # repo root: qoblib_tools & co.
 
 import argparse
 import itertools

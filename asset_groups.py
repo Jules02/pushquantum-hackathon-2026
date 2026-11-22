@@ -8,7 +8,7 @@ between groups.
 Blocks are solved in *net-position* space: per asset and day only ``v = L - S`` in
 ``[-ub, ub]`` is chosen, with ``L = max(v, 0)``, ``S = max(-v, 0)``. That loses
 nothing, because holding long and short at once never beats holding the net position
-(see ``check_netting`` in ``check_portfolio_compact.py``). A 5-asset group then has
+(see ``check_netting`` in ``experiments/check_portfolio_compact.py``). A 5-asset group then has
 ``7**5 = 16807`` options, few enough to solve exactly; :func:`solve_block_exact` is
 the default block solver and the reference for any other (e.g. QAOA) solver.
 

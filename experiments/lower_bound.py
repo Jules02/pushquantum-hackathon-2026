@@ -6,11 +6,16 @@ cash interest (the 4 slack bits weigh 10·2^k, so interest = -10·cash). Risk ``
 bounded below by ``λ_min(R_t)·Σ v_i² ≥ 3·min(0, λ_min)·Σ|v_i|`` (|v_i| ≤ 3), which is linear
 in units too. Relaxing integrality gives an LP whose optimum is ≤ every feasible score.
 
-    python lower_bound.py --instance po_a400_t15_orig --budget 100 --lam 1e-3 \
+    python experiments/lower_bound.py --instance po_a400_t15_orig --budget 100 --lam 1e-3 \
         --sol handin/po_a400_t15_orig_b100_l1e-3.sol
 """
 
 from __future__ import annotations
+
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # repo root: qoblib_tools & co.
 
 import argparse
 import time

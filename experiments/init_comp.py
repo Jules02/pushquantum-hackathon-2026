@@ -8,8 +8,8 @@ For the instance it is given, runs 5 initialisations × 3 seeds with everything 
 
 Run through the runner, then plot:
 
-    python auto_runner.py init_comp.py --tests local_small_risk_tests
-    python init_comp.py --plot AutoData/local_small_risk_tests_<HHMM>          # run dir or its JSON
+    python auto_runner.py experiments/init_comp.py --tests local_small_risk_tests
+    python experiments/init_comp.py --plot AutoData/local_small_risk_tests_<HHMM>          # run dir or its JSON
 
 Where the circuits run, decided per instance:
     ≤ 5000 variables: local (QAOA on CPU, PCE on GPU if present), or Qoro cloud with --cloud true.
@@ -42,7 +42,7 @@ from pathlib import Path
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parent
+REPO = Path(__file__).resolve().parent.parent  # repo root
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 warnings.filterwarnings("ignore", category=SyntaxWarning)
