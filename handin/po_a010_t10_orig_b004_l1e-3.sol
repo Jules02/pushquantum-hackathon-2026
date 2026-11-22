@@ -1,4 +1,4 @@
-# asset groups of 3 (random) + iterated search, SA start
+# exact_dp.py: exact DP over the 8341 feasible day holdings (proven optimal)
 instance po_a010_t10_orig
 budget 4
 lambda 0.001

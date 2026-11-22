@@ -241,7 +241,7 @@ class DaySearch:
         r = rng.random()
         if len(held) <= 2 and r < 0.5:  # (near) empty day: plant a random small book
             w = v.copy()
-            k = int(rng.integers(4, 21))
+            k = int(rng.integers(min(4, g), min(20, g) + 1))  # g < 20 on a010
             w[rng.choice(g, k, replace=False)] = rng.choice([-2, -1, 1, 2], k)
             if feasible(w):
                 return w
@@ -274,7 +274,11 @@ class DaySearch:
 
 def run(model: qt.PortfolioModel, L, S, time_limit: float, seed: int, kick_moves=(2, 8),
         ckpt: Path | None = None, verbose: bool = True, top: int = 0, days=None,
-        eps_rel: float = 2.5e-4, two_day: float = 0.2):
+        eps_rel: float = 2.5e-4, two_day: float = 0.2, stall: float | None = None,
+        window: int = 2):
+    """``stall``: also stop once no improvement was found for this many seconds.
+    ``window``: longest run of consecutive days a multi-day move spans (2 = two-day moves).
+    """
     rng = np.random.default_rng(seed)
     ev = BlockEvaluator(model)
     T, n = model.n_periods, len(model.symbols)
@@ -339,6 +343,8 @@ def run(model: qt.PortfolioModel, L, S, time_limit: float, seed: int, kick_moves
         return False
 
     while time.time() - t0 < time_limit and not _STOP[0]:
+        if stall and time.time() - t0 - trace[-1][0] > stall:
+            break
         t = int(rng.choice(days))
         nb = [d for d in (t - 1, t + 1) if d in day_set]
         if two_day and nb and rng.random() < two_day:
@@ -346,22 +352,37 @@ def run(model: qt.PortfolioModel, L, S, time_limit: float, seed: int, kick_moves
             # days to change at once (hold a position over both, or drop it on both)
             a, b = sorted((t, int(rng.choice(nb))))
             W = V.copy()
-            src, dst = (a, b) if rng.random() < 0.5 else (b, a)
+            win = [a, b]
+            if window > 2 and rng.random() < 0.5:
+                # longer window: hold (or drop) the same positions over w consecutive days,
+                # e.g. keep a position open three more days and hedge it meanwhile
+                w = int(rng.integers(3, window + 1))
+                a = int(rng.integers(t - w + 1, t + 1))
+                win = [d for d in range(a, a + w) if d in day_set]
+                if len(win) < 3 or win != list(range(win[0], win[0] + len(win))):
+                    continue
+                a, b = win[0], win[-1]
+                ends = [d for d in (a - 1, b + 1) if d in day_set]
+                src = int(rng.choice(win + ends))
+                dst = None
+            else:
+                src, dst = (a, b) if rng.random() < 0.5 else (b, a)
             held = np.flatnonzero(W[src])
             kicks2 += 1
             if len(held) == 0:
                 continue
             idx = rng.choice(held, max(1, int(len(held) * rng.uniform(0.05, 0.4))), replace=False)
             if rng.random() < 0.7:
-                W[dst, idx] = W[src, idx]
+                for d in ([dst] if dst is not None else win):
+                    W[d, idx] = W[src, idx]
             else:
-                W[a, idx] = 0
-                W[b, idx] = 0
-            if not (fix(W[a], idx) and fix(W[b], idx)):
+                for d in win:
+                    W[d, idx] = 0
+            if not all(fix(W[d], idx) for d in win):
                 continue
-            for _ in range(8):  # alternate exact day descents until both are settled
+            for _ in range(8):  # alternate exact day descents until the window is settled
                 moved = 0
-                for d in (a, b):
+                for d in win:
                     Ls, Ss = split(W)
                     W[d], n_mv = DaySearch(day_form(ev, Ls, Ss, d), top=top).descend(W[d])
                     moved += n_mv
@@ -423,7 +444,7 @@ def main() -> None:
     ap.add_argument("--instance", default="po_a400_t15_orig")
     ap.add_argument("--budget", type=int, default=100)
     ap.add_argument("--lam", default="1e-3")
-    ap.add_argument("--init", required=True)
+    ap.add_argument("--init", required=True, help='start .sol file, or "empty"')
     ap.add_argument("--time", type=float, default=600)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="results/day_swap")
@@ -435,11 +456,16 @@ def main() -> None:
                     help="threshold acceptance: working state may be this share of |day cost| worse")
     ap.add_argument("--kick-min", type=int, default=2)
     ap.add_argument("--kick-max", type=int, default=8)
+    ap.add_argument("--window", type=int, default=2, help="longest multi-day move, in days")
     args = ap.parse_args()
     signal.signal(signal.SIGTERM, _on_term)
     model = qt.PortfolioModel(qt.load_portfolio_instance(args.instance), budget=args.budget, lam=args.lam)
-    _, pos = qt.read_portfolio_solution(args.init)
-    L, S = (a.astype(np.int64) for a in model.to_arrays(pos))
+    if args.init == "empty":
+        L = np.zeros((model.n_periods, len(model.symbols)), np.int64)
+        S = L.copy()
+    else:
+        _, pos = qt.read_portfolio_solution(args.init)
+        L, S = (a.astype(np.int64) for a in model.to_arrays(pos))
     sc = model.score_arrays(L, S)
     assert sc.feasible
     print(f"{args.instance} B={args.budget} λ={args.lam}: start {sc.objective} from {args.init}", flush=True)
@@ -448,7 +474,7 @@ def main() -> None:
     stem = f"{args.instance}_b{args.budget:03d}_l{args.lam}"
     r = run(model, L, S, args.time, args.seed, ckpt=out / f"{stem}.ckpt.sol", top=args.top,
             kick_moves=(args.kick_min, args.kick_max), days=args.days, verbose=not args.quiet,
-            eps_rel=args.eps_rel, two_day=args.two_day)
+            eps_rel=args.eps_rel, two_day=args.two_day, window=args.window)
     final = model.score_arrays(r["L"], r["S"])
     assert final.feasible and final.objective == r["score"]
     sol = out / f"{stem}_seed{args.seed}.sol"
