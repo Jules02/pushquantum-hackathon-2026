@@ -83,7 +83,8 @@ def main(argv=None) -> int:
     p.add_argument("--sa-reads", type=int, default=20)
     p.add_argument("--sa-sweeps", type=int, default=2000)
     p.add_argument("--no-sa", action="store_true", help="start from an empty portfolio (use on a400)")
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=1909)
+
     add_solver_args(p)
     args = p.parse_args(argv)
     if args.postprocess:
