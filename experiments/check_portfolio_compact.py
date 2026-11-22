@@ -1,8 +1,13 @@
 """Checks that CompactPortfolioQUBO is exact (keeps the official score and optimum).
 
-Run: python check_portfolio_compact.py
+Run: python experiments/check_portfolio_compact.py
 """
 from __future__ import annotations
+
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # repo root: qoblib_tools & co.
 
 import numpy as np
 

@@ -5,7 +5,7 @@ re-scored with the official referee (``qoblib_tools.PortfolioModel.score``). Per
 instance the best feasible one is copied to ``handin/<instance>_b<B>_l<λ>.sol`` (only
 if it beats the file already there), and ``handin/RESULTS.md`` lists every hand-in file
 with its gap to QOBLIB's best-known value. ``submission/<stem>.json`` gets the qubit
-count and method line for the Aqora upload (``solution_sender.py``).
+count and method line for the Aqora upload (``submission/upload.py``).
 
     python make_handin.py --dirs results/grid results/grid_polish results/day_swap
 """

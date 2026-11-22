@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """QOBLIB portfolio solver: clamp asset/day blocks, solve each QUBO with SA.
 
-Run from the Project directory (requires NumPy, SciPy, requests and dimod):
-    python auto_runner_extensive.py solver_partitioned_sa.py --manual 0 --silent
+Run from the repository root (requires NumPy, SciPy, requests and dimod):
+    python auto_runner.py experiments/solver_partitioned_sa.py --manual 0 --silent
 
 Pass solver options after the runner's ``--`` separator, e.g. ``--reheats 2``.
 Uses the optional dwave-samplers package when available; otherwise uses NumPy.
@@ -10,6 +10,11 @@ No Divi, Maestro, or credentials are needed.
 """
 
 from __future__ import annotations
+
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # repo root: qoblib_tools & co.
 
 import argparse
 import json
@@ -34,7 +39,7 @@ from auto_worker import load_instance_dir
 from big_blocks import block_form, solve_sa
 from qaoa_signed_blocks import CODES, block_qubo, decode
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parent.parent  # repo root
 DEFAULT_SEEDS = (1, 2, 3)
 
 

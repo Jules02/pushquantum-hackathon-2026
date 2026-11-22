@@ -13,5 +13,3 @@ __pycache__/
 qoro_venv/
 # Hand-in solutions are tracked
 !handin/*.sol
-# AutoRunner
-AutoData/
