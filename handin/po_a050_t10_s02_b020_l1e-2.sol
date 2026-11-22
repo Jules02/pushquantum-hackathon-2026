@@ -1,8 +1,16 @@
+<<<<<<< HEAD
 # QOBLIB: partitioned simulated annealing
 instance po_a050_t10_s02
 budget 20
 lambda 0.01
 objective -59407
+=======
+# recombine_runs.py: exact DP over the day holdings of 9 solutions, then day_swap.py polish (120 s, window moves)
+instance po_a050_t10_s02
+budget 20
+lambda 0.01
+objective -60940
+>>>>>>> d8e593b8632d13455023532d80170d8053fd4018
 # period symbol long short
 0 ABBV 1 0
 0 ACN 0 2
@@ -21,6 +29,7 @@ objective -59407
 0 TMUS 1 0
 0 WMT 0 2
 0 XOM 0 1
+<<<<<<< HEAD
 1 AAPL 1 0
 1 ACN 0 1
 1 AMD 0 1
@@ -58,6 +67,26 @@ objective -59407
 2 PEP 0 1
 2 TMUS 0 1
 2 WMT 1 0
+=======
+1 ADBE 0 1
+1 AMD 0 1
+1 AMZN 1 0
+1 BAC 0 1
+1 BX 0 1
+1 CAT 1 0
+1 COST 0 2
+1 CSCO 1 0
+1 JNJ 0 1
+1 JPM 1 0
+1 MCD 1 0
+1 MSFT 1 0
+1 NFLX 1 0
+1 NVDA 1 0
+1 ORCL 0 1
+1 PEP 1 0
+1 TMUS 2 0
+1 TSLA 1 0
+>>>>>>> d8e593b8632d13455023532d80170d8053fd4018
 4 AAPL 0 1
 4 ABT 1 0
 4 BAC 1 0
@@ -77,6 +106,7 @@ objective -59407
 4 TSLA 0 1
 4 UNH 0 1
 4 XOM 1 0
+<<<<<<< HEAD
 5 AAPL 0 1
 5 CAT 1 0
 5 CVX 2 0
@@ -111,6 +141,44 @@ objective -59407
 6 PM 1 0
 6 TMUS 0 1
 6 UNH 0 2
+=======
+5 ABBV 0 1
+5 BAC 1 0
+5 CVX 1 0
+5 GE 1 0
+5 GOOG 0 1
+5 GOOGL 1 0
+5 GS 1 0
+5 JPM 0 2
+5 LLY 0 1
+5 MA 2 0
+5 MCD 0 1
+5 MSFT 0 1
+5 ORCL 1 0
+5 PG 0 1
+5 TMO 1 0
+5 V 0 2
+5 WMT 1 0
+6 AAPL 1 0
+6 ABBV 0 1
+6 ABT 0 1
+6 ACN 0 1
+6 AMD 0 1
+6 AMZN 1 0
+6 COST 1 0
+6 CVX 0 1
+6 GE 1 0
+6 GOOG 0 1
+6 GS 0 1
+6 ISRG 1 0
+6 MA 1 0
+6 MCD 1 0
+6 PEP 1 0
+6 PG 0 1
+6 TMUS 0 1
+6 UNH 0 2
+6 WFC 1 0
+>>>>>>> d8e593b8632d13455023532d80170d8053fd4018
 7 AXP 0 1
 7 BX 1 0
 7 CRM 1 0

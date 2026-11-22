@@ -1,8 +1,8 @@
-# day_swap.py: whole-day pair-move descent + per-day ILS from handin/po_a050_t10_s01_b020_l1e-3.sol
+# day_swap.py run(seed=1, 120 s) from empty
 instance po_a050_t10_s01
 budget 20
 lambda 0.001
-objective -141376
+objective -141513
 # period symbol long short
 0 ABT 0 2
 0 ADBE 0 1
@@ -111,16 +111,17 @@ objective -141376
 7 AMD 0 1
 7 AVGO 3 0
 7 AXP 1 0
-7 CAT 1 0
-7 CVX 0 1
 7 GE 1 0
 7 META 0 1
-7 MRK 1 0
+7 NOW 0 1
+7 NVDA 1 0
 7 ORCL 0 1
-7 PEP 0 2
+7 PEP 0 1
 7 UNH 0 1
+7 V 0 1
 7 WFC 1 0
 7 WMT 0 2
+7 XOM 1 0
 8 AAPL 0 1
 8 ACN 0 1
 8 AMD 0 1

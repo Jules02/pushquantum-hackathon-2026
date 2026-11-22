@@ -8,10 +8,9 @@ AutoData/
 __pycache__/
 .ipynb_checkpoints/
 .DS_Store
+.pytest_cache/
 
 # Venvs
 qoro_venv/
 # Hand-in solutions are tracked
 !handin/*.sol
-# AutoRunner
-AutoData/
