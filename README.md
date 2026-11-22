@@ -171,3 +171,28 @@ print(qt.check_network_solution("network12.sol", 12, qt.load_network_demand(12))
 
 Created when you run the notebooks (ignored by git): `qoblib_data/` (downloaded instances), the `.sol`
 files, `__pycache__/`.
+
+## Quantum reheat (optional, experimental)
+
+`--quantum-reheat {off,always,stuck}` (default `off`; off is the previous behaviour).
+
+After the first SA stage of a block, a TQA-initialised QAOA is run on the block QUBO. Its
+lowest-energy samples, picked greedily for Hamming diversity, replace the usual start states
+of the following SA reheat stage (run at `--quantum-reheat-scale`). QAOA samples are also
+scored as ordinary candidates and can become the incumbent.
+
+**This is a heuristic restart distribution, not a sampler with detailed balance.** The QAOA
+samples come from a finite-shot, finite-depth circuit, and neither their probabilities nor
+the SA acceptance rule form a Markov chain with a known stationary distribution. Do not read
+it as exact SA/PT or as evidence of quantum advantage. The ablation in
+`bench_quantum_reheat.py` is the only evidence it helps.
+
+It is skipped (and counted in `sa.quantum`) when:
+- the block has fewer than `--quantum-min-qubits` (24) or more than `--quantum-max-qubits`
+  (26) QUBO variables (3 per asset: use `--group-size 8`);
+- `--quantum-budget` QAOA runs per seed are spent;
+- the policy says the block is not stuck (`stuck`: no improvement after stage 1, or a
+  plateau of near-minimal reads, or the same block failed to improve last time);
+- `--reheats 0` or `--block-solver exact`.
+
+Unchanged blocks reuse cached QAOA samples. Credits are 0 on the local simulator.

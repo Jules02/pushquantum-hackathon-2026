@@ -209,12 +209,10 @@ class QAOABlockSolver:
         return (tuple(days), tuple(G.tolist()), L[days].tobytes(), S[days].tobytes(),
                 L[nb][:, G].tobytes(), S[nb][:, G].tobytes())
 
-    def _qaoa(self, bqm) -> np.ndarray:
-        """Top-``self.top`` bitstrings (K, nq) of QAOA on ``bqm``."""
+    def _make_qaoa(self, bqm):
         from divi.qprog.algorithms import QAOA
         from divi.qprog.optimizers import ScipyMethod, ScipyOptimizer
         from divi.qprog.problems import BinaryOptimizationProblem
-
         # QAOA needs O(1) energies: rescale (argmin unchanged)
         scale = max(np.abs(list(bqm.linear.values())).max(),
                     np.abs(list(bqm.quadratic.values()) or [0.0]).max())
@@ -223,6 +221,20 @@ class QAOABlockSolver:
         q = QAOA(BinaryOptimizationProblem(bqm_n), n_layers=self.layers,
                  optimizer=ScipyOptimizer(method=ScipyMethod.COBYLA),
                  max_iterations=self.iters, backend=self.backend, seed=self.seed)
+        return q, bqm_n
+    
+    def _top_bits(self, q, bqm_n):
+        tops = q.get_top_solutions(n=self.top)
+        # Divi orders bitstring characters like bqm_n.variables (0..nq-1 here)
+        order = list(bqm_n.variables)
+        bits = np.array([[int(ch) for ch in s.bitstring] for s in tops], dtype=np.int8)
+        out = np.zeros_like(bits)
+        out[:, order] = bits        
+        return out
+
+    def _qaoa(self, bqm) -> np.ndarray:
+        """Top-``self.top`` bitstrings (K, nq) of QAOA on ``bqm``."""
+        q, bqmn = self._make_qaoa(bqm)
         t0 = time.time()
         if self.init == "tqa":
             q.run(initial_params=tqa_params(self.layers, self.tqa_dt).reshape(q.get_expected_param_shape()))
@@ -230,13 +242,7 @@ class QAOABlockSolver:
             q.run()
         self.stats["qaoa_seconds"] += time.time() - t0
         self.stats["qaoa_runs"] += 1
-        tops = q.get_top_solutions(n=self.top)
-        # Divi orders bitstring characters like bqm_n.variables (0..nq-1 here)
-        order = list(bqm_n.variables)
-        bits = np.array([[int(ch) for ch in s.bitstring] for s in tops], dtype=np.int8)
-        out = np.zeros_like(bits)
-        out[:, order] = bits
-        return out
+        return self._top_bits(q, bqmn)
 
     def __call__(self, ev: BlockEvaluator, L, S, days, G: np.ndarray) -> BlockResult:
         assert ev.model.ub == 3, "signed 3-bit encoding needs ub = 3"

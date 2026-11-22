@@ -1,8 +1,8 @@
-# day_swap.py: whole-day pair-move descent + per-day ILS from results/day_swap/a050_runs/orig_1e-2/po_a050_t10_orig_b020_l1e-2_seed0.sol
+# QOBLIB: partitioned simulated annealing. QAOA Reheating!
 instance po_a050_t10_orig
 budget 20
 lambda 0.01
-objective -47301
+objective -49970
 # period symbol long short
 1 AMZN 0 1
 1 BAC 1 0
@@ -52,21 +52,40 @@ objective -47301
 3 PM 0 2
 3 WMT 2 0
 3 XOM 1 0
-4 AMZN 0 1
-4 AXP 0 1
-4 BAC 0 1
-4 CSCO 1 0
-4 DIS 2 0
+4 ABBV 0 1
+4 DIS 1 0
 4 GE 1 0
 4 HD 0 1
-4 KO 2 0
-4 MA 2 0
-4 META 1 0
-4 PEP 0 1
+4 IBM 0 1
+4 JNJ 2 0
+4 JPM 2 0
+4 MA 1 0
+4 MS 0 1
+4 NFLX 1 0
+4 PEP 1 0
 4 PM 0 2
+4 TSLA 0 1
 4 V 0 1
-4 WFC 2 0
+4 WMT 2 0
 4 XOM 1 0
+5 ABBV 1 0
+5 ABT 0 1
+5 AXP 0 1
+5 BAC 1 0
+5 BX 1 0
+5 CAT 0 2
+5 CSCO 0 1
+5 GE 1 0
+5 IBM 1 0
+5 JNJ 0 1
+5 KO 0 1
+5 LIN 0 1
+5 MA 2 0
+5 META 0 1
+5 NOW 1 0
+5 PM 1 0
+5 UNH 0 1
+5 V 0 1
 6 ABT 1 0
 6 AXP 0 1
 6 BAC 0 2

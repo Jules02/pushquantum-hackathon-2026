@@ -11,6 +11,7 @@ No Divi, Maestro, or credentials are needed.
 
 from __future__ import annotations
 
+import dataclasses
 import argparse
 import json
 import os
@@ -130,11 +131,8 @@ def encode_holding(holding: np.ndarray, weights: np.ndarray, offsets: np.ndarray
     values = (CODES @ weights.T).T + offsets[:, None]
     return CODES[(values == holding[:, None]).argmax(axis=1)].reshape(-1).astype(np.int8)
 
-
 class PartitionSASolver:
-    """Adapter from BQM sampling stages to asset_groups.BlockSolver (with mu ladder)."""
-
-    def __init__(self, stages, seed, integer_polish=None, mu_ladder=(0.25, 1.0, 4.0)):
+    def __init__(self, stages, seed, integer_polish=None, mu_ladder=(0.25, 1.0, 4.0), quantum=None):
         self.stages = stages
         self.rng = np.random.default_rng(seed)
         self.integer_polish = integer_polish
@@ -142,6 +140,8 @@ class PartitionSASolver:
         self.stage_calls = 0
         self.max_qubo_vars = 0
         self.mu_raised = 0
+        self.quantum = quantum            # quantum_reheat.QuantumReheat | None
+        self._stalled = {}                # block key -> did not improve last time
 
     @staticmethod
     def _unit_scale(ev, L, S, days, G):
@@ -157,7 +157,10 @@ class PartitionSASolver:
         current = L[days[0], G] - S[days[0], G]
         best = current
         best_cost = ev.costs(L, S, days, G, current[None])[0][0]
+        cur_cost = best_cost
         unit = None
+        q = self.quantum
+        block_key = (tuple(days), np.asarray(G).tobytes()) if q is not None else None
 
         for k, step in enumerate((0.0,) + self.mu_ladder):
             if k >= 1:
@@ -168,11 +171,27 @@ class PartitionSASolver:
             bqm, weights, offsets, _ = block_qubo(ev, L, S, days, G, mu=mu)
             self.max_qubo_vars = max(self.max_qubo_vars, bqm.num_variables)
             labels = list(range(bqm.num_variables))
-            best_bits = encode_holding(best, weights, offsets)  # re-encode per rung
+            best_bits = encode_holding(best, weights, offsets)
             starts = best_bits[None]
             low_feasible = False
 
-            for stage in self.stages:
+            def absorb(bits):
+                """Evaluate samples; update the incumbent. Returns the feasibility mask."""
+                nonlocal best, best_cost, best_bits
+                holdings = decode(bits, weights, offsets)
+                costs, feasible = ev.costs(L, S, days, G, holdings)
+                if feasible.any():
+                    j = int(np.argmin(np.where(feasible, costs, np.inf)))
+                    if costs[j] < best_cost - 1e-9:
+                        best, best_cost, best_bits = holdings[j], costs[j], bits[j]
+                return feasible
+
+            seq, i, quantum_next = list(self.stages), 0, False
+            while i < len(seq):
+                stage = seq[i]
+                i += 1
+                was_quantum, quantum_next = quantum_next, False
+                cost_before = best_cost
                 bits = np.asarray(stage(bqm, starts, self.rng))
                 self.stage_calls += 1
                 if bits.ndim != 2 or bits.shape[1] != bqm.num_variables or not np.all(
@@ -182,21 +201,57 @@ class PartitionSASolver:
                 if not len(bits):
                     continue
                 bits = bits.astype(np.int8, copy=False)
-                holdings = decode(bits, weights, offsets)
-                costs, feasible = ev.costs(L, S, days, G, holdings)
-                if feasible.any():
-                    j = int(np.argmin(np.where(feasible, costs, np.inf)))
-                    if costs[j] < best_cost - 1e-9:
-                        best, best_cost, best_bits = holdings[j], costs[j], bits[j]
+                feasible = absorb(bits)
                 energies = bqm.energies((bits, labels))
                 jl = int(np.argmin(energies))
-                low_feasible = bool(feasible[jl])      # lowest-QUBO-energy sample obeys rules
+                low_feasible = bool(feasible[jl])
                 low_energy = bits[jl]
                 starts = best_bits[None] if np.array_equal(best_bits, low_energy) else np.stack(
                     (best_bits, low_energy)
                 )
+
+                if q is None:
+                    continue
+                if i >= 2:                                   # a reheat stage just ran
+                    improved = best_cost < cost_before - 1e-9
+                    if was_quantum:
+                        q.stats.reheats_after_quantum += 1
+                        q.stats.improvements_after_quantum_reheat += int(improved)
+                    else:
+                        q.stats.reheats_after_classical += 1
+                        q.stats.improvements_after_classical_reheat += int(improved)
+                elif len(seq) > 1 and q.policy.mode != "off":  # stage 1 done, reheat follows
+                    if q.stats.qaoa_calls >= q.policy.budget:
+                        q.stats.skipped_budget += 1
+                        continue
+                    reason = q.policy.reason(best_cost, cur_cost, energies,
+                                             self._stalled.get(block_key, False))
+                    if reason is None:
+                        continue
+                    qbits = np.asarray(q.stage(bqm, starts, self.rng))
+                    if qbits.ndim != 2 or qbits.shape[1] != bqm.num_variables:
+                        raise ValueError("QAOA seed stage must return (reads, n_bits)")
+                    if not len(qbits):                       # skipped (too small/large)
+                        continue
+                    qbits = qbits.astype(np.int8, copy=False)
+                    q.stats.triggers[reason] += 1
+                    before = best_cost
+                    absorb(qbits)                            # QAOA samples may become incumbent
+                    q.stats.qaoa_direct_improvements += int(best_cost < before - 1e-9)
+                    seeds = q.stage.select_seeds(
+                        qbits, bqm.energies((qbits, labels)), q.stage.n_seeds)
+                    if len(seeds):
+                        seeds = seeds[(seeds != best_bits).any(axis=1)]
+                    starts = np.vstack([best_bits[None], seeds]).astype(np.int8)
+                    if isinstance(seq[i], AnnealStage):
+                        seq[i] = dataclasses.replace(seq[i], start_temperature_scale=q.reheat_scale)
+                    quantum_next = True
+
             if low_feasible:
-                break                                   # budget price is high enough
+                break
+
+        if q is not None:
+            self._stalled[block_key] = not (best_cost < cur_cost - 1e-9)
 
         if self.integer_polish is not None:
             chains, sweeps = self.integer_polish
@@ -262,6 +317,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--kick-size", type=positive_int, default=5)
     p.add_argument("--day-swap", type=float, default=0.0,
                help="seconds of day_swap.run after block passes (0 = off)")
+    p.add_argument("--quantum-reheat", choices=("off", "always", "stuck"), default="off")
+    p.add_argument("--stuck-frac", type=float, default=0.5)
+    p.add_argument("--quantum-min-qubits", type=positive_int, default=24)
+    p.add_argument("--quantum-max-qubits", type=positive_int, default=26)
+    p.add_argument("--quantum-budget", type=positive_int, default=20, help="max QAOA runs per seed")
+    p.add_argument("--quantum-reheat-scale", type=float, default=1.25)
+    p.add_argument("--quantum-layers", type=positive_int, default=2)
+    p.add_argument("--quantum-iters", type=int, default=15, help="0 = sample TQA angles unoptimised")
+    p.add_argument("--quantum-shots", type=positive_int, default=4000)
+    p.add_argument("--quantum-top", type=positive_int, default=64)
+    p.add_argument("--quantum-seeds", type=positive_int, default=8)
+    p.add_argument("--quantum-init", choices=("tqa", "random"), default="tqa")
+    p.add_argument("--quantum-tqa-dt", type=float, default=1.0)
+    p.add_argument("--quantum-null-control", action="store_true",
+                   help="bench only: replace QAOA samples with uniform random bitstrings")    
     return p
 
 
@@ -283,15 +353,17 @@ def load_instance(instance: str, instance_dir: Path | None) -> qt.PortfolioInsta
             return load_instance_dir(directory, base)
     return qt.load_portfolio_instance(base)
 
-def resolve_init_path(name: str) -> Path:
+def resolve_init_path(name: str, sol_name: str) -> Path:
     """Accept a path as given, or a bare filename found in handin/ (next to this script)."""
-    p = Path(name)
-    for cand in (p, Path.cwd() / "handin" / p.name, SCRIPT_DIR / "handin" / p.name):
+    p = Path(name).expanduser()
+    for cand in (p, Path.cwd() / "handin" / p.name, SCRIPT_DIR / p, SCRIPT_DIR / "handin" / p.name):
+        if cand.is_dir():
+            cand = cand / sol_name
         if cand.is_file():
             return cand
-    raise FileNotFoundError(
-        f"--init {name!r} not found (looked in ., ./handin and {SCRIPT_DIR / 'handin'})"
-    )
+    if p.suffix == ".sol":
+        raise FileNotFoundError(f"--init {name!r} not found")
+    return None
 
 def main(argv: list[str] | None = None) -> int:
     p = build_arg_parser()
@@ -316,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"SA backend: {backend} on CPU; up to {args.block_sweeps} block passes per seed, "
           f"{args.sa_reads} reads × {args.sa_sweeps} sweeps per stage, {args.reheats} reheats.",
           flush=True)
-
+    solvers = []
     inst = load_instance(args.instance, Path(args.instance_dir) if args.instance_dir else None)
     if args.assets is not None and inst.n_assets != args.assets:
         raise ValueError(f"Asset count mismatch for {inst.name}: expected {args.assets}, got {inst.n_assets}")
@@ -324,14 +396,24 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(f"Day/period count mismatch for {inst.name}: expected {args.days}, got {inst.n_periods}")
     if args.cloud:
         print("--cloud was requested; partitioned SA still runs locally on CPU.", flush=True)
+    if args.quantum_reheat != "off":
+        if args.block_solver != "sa" or args.reheats < 1:
+            p.error("--quantum-reheat needs --block-solver sa and --reheats >= 1")
+        if args.quantum_iters == 0 and args.quantum_init != "tqa":
+            p.error("--quantum-iters 0 requires --quantum-init tqa")
     if args.block_solver == "exact":
         if args.group_size > 5:
             p.error("--block-solver exact is only sensible for --group-size <= 5")
         make_solver = lambda seed: solve_block_exact
     else:
+        make_quantum = None
+        if args.quantum_reheat != "off":
+            from quantum_reheat import QuantumReheat   # imports Divi lazily, only when used
+            make_quantum = lambda seed: QuantumReheat.from_args(args, seed)
         polish = (args.polish_chains, args.polish_sweeps) if args.integer_polish else None
-        make_solver = lambda seed: PartitionSASolver(stages, seed, polish, tuple(args.mu_ladder))
-
+        make_solver = lambda seed: PartitionSASolver(
+            stages, seed, polish, tuple(args.mu_ladder),
+            quantum=make_quantum(seed) if make_quantum else None)
     model = qt.PortfolioModel(inst, budget=args.budget, lam=args.lam)
     if not model.score({}).feasible:
         raise ValueError("The empty portfolio is infeasible for this budget; cannot initialize the block solver")
@@ -342,7 +424,8 @@ def main(argv: list[str] | None = None) -> int:
     groups = grouping_fn(model, args.group_size, args.group_method)
     L0 = S0 = None
     if args.init:
-        init_path = resolve_init_path(args.init)
+        sol_name = resolve_solution_path(args.instance, inst.name, args.budget, args.lam).name
+        init_path = resolve_init_path(args.init, sol_name)
         header, init_pos = qt.read_portfolio_solution(init_path)
         try:
             hdr_lam = Fraction(header["lambda"])
@@ -367,6 +450,7 @@ def main(argv: list[str] | None = None) -> int:
     for seed in seeds:
         t0 = time.perf_counter()
         solver = make_solver(seed)
+        solvers.append(solver)
         if args.time > 0:      # includes its own clamp_and_iterate pass
             result = iterated_search(model, groups, L=L0, S=S0, time_limit=args.time,
                                      kick_blocks=args.kick_blocks, kick_size=args.kick_size,
@@ -381,6 +465,13 @@ def main(argv: list[str] | None = None) -> int:
             ds = day_swap.run(model, result["L"], result["S"], args.day_swap, seed, verbose=False)
             if ds["score"] < result["score"]:
                 result.update(score=ds["score"], L=ds["L"], S=ds["S"])
+        qsum = None
+        if args.quantum_reheat != "off":
+            from quantum_reheat import QuantumStats
+            qsum = QuantumStats()
+            for s_ in solvers:
+                if getattr(s_, "quantum", None) is not None:
+                    qsum.merge(s_.quantum.stats)
         stage_calls = getattr(solver, "stage_calls", 0)
         max_vars = max(max_vars, getattr(solver, "max_qubo_vars", 0))
         score = int(result["score"])
@@ -424,6 +515,11 @@ def main(argv: list[str] | None = None) -> int:
                 "group_method": args.group_method, "group_size_assets": args.group_size,
                 "max_block_sweeps": args.block_sweeps, "patience": args.patience,
                 "integer_polish": args.integer_polish,
+                "quantum_reheat": args.quantum_reheat,
+                **({"quantum": {**qsum.as_dict(), "reheat_scale": args.quantum_reheat_scale,
+                                "layers": args.quantum_layers, "iters": args.quantum_iters,
+                                "init": args.quantum_init, "budget_per_seed": args.quantum_budget}}
+                   if qsum is not None else {}),
             },
         },
     }
